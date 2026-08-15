@@ -143,18 +143,71 @@ local function isRecording()
     return system.getTimer() < recordingEndTime
 end
 
--- Helper to copy file (works across volumes)
-local function copyFile(src, dst)
+-- Publish across a filesystem boundary, where rename fails EXDEV: copy beside
+-- the destination and rename within that directory. Returns nil on success.
+local function copyThenRename(src, finalPath)
     local infile = io.open(src, "rb")
-    if not infile then return false end
+    if not infile then return "staged capture disappeared" end
     local content = infile:read("*all")
     infile:close()
 
-    local outfile = io.open(dst, "wb")
-    if not outfile then return false end
+    local nearby = finalPath .. ".part"
+    local outfile = io.open(nearby, "wb")
+    if not outfile then return "cannot write to " .. tostring(finalPath) end
     outfile:write(content)
     outfile:close()
-    return true
+
+    local ok, err = os.rename(nearby, finalPath)
+    if not ok then
+        os.remove(nearby)
+        return tostring(err)
+    end
+    return nil
+end
+
+-- Publish a capture under its final name, atomically. display.save() writes on
+-- a later render frame, so this waits for the staged file to exist and be
+-- non-empty; the rename is what the reader sees, so never a partial image.
+local function publishWhenReady(stagedName, finalPath, label)
+    local tries = 0
+    local function attempt()
+        tries = tries + 1
+        local staged = system.pathForFile(stagedName, system.TemporaryDirectory)
+        local ready = false
+        if staged then
+            local f = io.open(staged, "rb")
+            if f then
+                -- A file that exists but is still empty is a capture mid-flight.
+                ready = (f:seek("end") or 0) > 0
+                f:close()
+            end
+        end
+        if ready then
+            if not os.rename(staged, finalPath) then
+                local err = copyThenRename(staged, finalPath)
+                if err then
+                    print("[MCP Screenshot] Warning: could not publish " .. tostring(label) ..
+                          ": " .. tostring(err))
+                end
+            end
+            os.remove(staged)
+            return true
+        end
+        if tries >= 30 then   -- ~half a second at 60fps; something is wrong
+            print("[MCP Screenshot] Warning: capture never appeared for " .. tostring(label))
+            -- An empty staged file may still be lying there.
+            if staged then os.remove(staged) end
+            return true
+        end
+        return false
+    end
+
+    local function onFrame()
+        if attempt() then
+            Runtime:removeEventListener("enterFrame", onFrame)
+        end
+    end
+    Runtime:addEventListener("enterFrame", onFrame)
 end
 
 -- Capture screenshot
@@ -164,45 +217,34 @@ local function captureScreen()
     screenshotCount = screenshotCount + 1
     local filename = string.format("screenshot_%03d.jpg", screenshotCount)
     local fullPath = screenshotDir .. "/" .. filename
+    -- Still .jpg: Solar2D picks the encoder from the extension.
+    local staged = string.format("_staging_%03d.jpg", screenshotCount)
 
-    -- Capture the display to Solar2D's temp directory
     display.save(display.currentStage, {{
-        filename = filename,
+        filename = staged,
         baseDir = system.TemporaryDirectory,
         captureOffscreenArea = false,
         isFullResolution = false
     }})
 
-    -- Copy from Solar2D temp to our /tmp/ screenshot directory
-    local tempPath = system.pathForFile(filename, system.TemporaryDirectory)
-    if tempPath then
-        if copyFile(tempPath, fullPath) then
-            os.remove(tempPath)  -- Clean up temp file
-        end
-    end
+    publishWhenReady(staged, fullPath, filename)
 end
 
--- Capture a single on-demand screenshot (not part of recording sequence)
-local function captureOnDemand()
-    local filename = "screenshot_latest.jpg"
+-- Capture on demand, published as screenshot_<k>.jpg: a name that has never
+-- existed, so the reader cannot be handed a leftover from an earlier request.
+local function captureOnDemand(k)
+    local filename = "screenshot_" .. tostring(k) .. ".jpg"
     local fullPath = screenshotDir .. "/" .. filename
+    local staged = "_staging_" .. tostring(k) .. ".jpg"
 
-    -- Capture the display to Solar2D's temp directory
     display.save(display.currentStage, {{
-        filename = filename,
+        filename = staged,
         baseDir = system.TemporaryDirectory,
         captureOffscreenArea = false,
         isFullResolution = false
     }})
 
-    -- Copy from Solar2D temp to our /tmp/ screenshot directory
-    local tempPath = system.pathForFile(filename, system.TemporaryDirectory)
-    if tempPath then
-        if copyFile(tempPath, fullPath) then
-            os.remove(tempPath)  -- Clean up temp file
-            print("[MCP Screenshot] On-demand capture saved")
-        end
-    end
+    publishWhenReady(staged, fullPath, filename)
 end
 
 -- Check control file for recording commands
@@ -210,9 +252,14 @@ local function checkControl()
     local content = readControlFile()
     if not content then return end
 
-    -- Check for "now" command (on-demand capture)
+    -- Bare "now" stays understood, for an older client.
+    local k = content:match("^now:(%w+)$")
+    if k then
+        captureOnDemand(k)
+        return
+    end
     if content == "now" then
-        captureOnDemand()
+        captureOnDemand("latest")
         return
     end
 
