@@ -5,8 +5,10 @@ Screenshot tools - Control screenshot recording and retrieve captured images.
 import asyncio
 import base64
 import os
+import re
 import shutil
 import tempfile
+import uuid
 from pathlib import Path
 
 from mcp.types import ImageContent, TextContent, Tool
@@ -131,6 +133,10 @@ ENCODE_VIDEO_TOOL = Tool(
 TOOLS = [START_RECORDING_TOOL, STOP_RECORDING_TOOL, GET_SCREENSHOT_TOOL, LIST_SCREENSHOTS_TOOL, ENCODE_VIDEO_TOOL]
 
 
+# A recorded frame, as opposed to an on-demand capture or a stray file.
+RECORDED = re.compile(r"^screenshot_\d+\.jpg$")
+
+
 def _get_project_name(project_path: str) -> str:
     """Get the project name from the path."""
     main_lua_path = find_main_lua(project_path)
@@ -221,31 +227,33 @@ async def handle_get_screenshot(arguments: dict) -> list[TextContent | ImageCont
         # Ensure screenshot dir exists
         os.makedirs(screenshot_dir, exist_ok=True)
 
-        # Write "now" command to trigger immediate capture
+        # Ask for a filename that has never existed: it appearing means this
+        # capture is done and written. The leading letter keeps it out of
+        # RECORDED, which an all-digit token would otherwise match.
+        token = "x" + uuid.uuid4().hex[:11]
         with open(control_file, 'w') as f:
-            f.write("now")
+            f.write(f"now:{token}")
 
-        # Wait for the screenshot to be captured (polling interval is 500ms)
-        latest_file = os.path.join(screenshot_dir, "screenshot_latest.jpg")
-        # Get current mtime if file exists
-        old_mtime = os.path.getmtime(latest_file) if os.path.exists(latest_file) else 0
+        target = os.path.join(screenshot_dir, f"screenshot_{token}.jpg")
 
-        # Wait up to 2 seconds for new screenshot
-        for _ in range(20):
+        # The Lua side polls every 500ms and then needs a render frame.
+        for _ in range(50):
             await asyncio.sleep(0.1)
-            if os.path.exists(latest_file):
-                new_mtime = os.path.getmtime(latest_file)
-                if new_mtime > old_mtime:
-                    # New screenshot captured
+            if os.path.exists(target):
+                try:
+                    with open(target, 'rb') as f:
+                        image_data = base64.standard_b64encode(f.read()).decode('utf-8')
+                except Exception as e:
+                    return [TextContent(type="text", text=f"Error reading screenshot: {str(e)}")]
+                finally:
+                    # One capture, one file, and the caller has it now.
                     try:
-                        with open(latest_file, 'rb') as f:
-                            image_data = base64.standard_b64encode(f.read()).decode('utf-8')
-
-                        return [
-                            ImageContent(type="image", data=image_data, mimeType="image/jpeg")
-                        ]
-                    except Exception as e:
-                        return [TextContent(type="text", text=f"Error reading screenshot: {str(e)}")]
+                        os.remove(target)
+                    except OSError:
+                        pass
+                return [
+                    ImageContent(type="image", data=image_data, mimeType="image/jpeg")
+                ]
 
         return [TextContent(
             type="text",
@@ -258,10 +266,9 @@ async def handle_get_screenshot(arguments: dict) -> list[TextContent | ImageCont
             text=f"Screenshot directory not found: {screenshot_dir}\n\nMake sure to run the project first with run_solar2d_project."
         )]
 
-    # Get list of recorded screenshots (exclude screenshot_latest.jpg)
+    # Match the numbered shape rather than excluding one known name.
     screenshots = sorted([
-        f for f in os.listdir(screenshot_dir)
-        if f.startswith("screenshot_") and f.endswith(".jpg") and f != "screenshot_latest.jpg"
+        f for f in os.listdir(screenshot_dir) if RECORDED.match(f)
     ])
 
     # Handle "last" - get most recent from recording
@@ -367,7 +374,7 @@ async def handle_encode_video(arguments: dict) -> list[TextContent]:
     # Frame numbers present (the recorder writes them contiguously as screenshot_NNN.jpg).
     nums = []
     for f in os.listdir(screenshot_dir):
-        if f.startswith("screenshot_") and f.endswith(".jpg") and f != "screenshot_latest.jpg":
+        if RECORDED.match(f):
             try:
                 nums.append(int(f[len("screenshot_"):-len(".jpg")]))
             except ValueError:
@@ -395,7 +402,8 @@ async def handle_encode_video(arguments: dict) -> list[TextContent]:
     if not ffmpeg:
         return [TextContent(
             type="text",
-            text="ffmpeg not found (checked PATH and Homebrew/system paths). Install it: brew install ffmpeg."
+            text="ffmpeg not found (checked PATH and the usual Homebrew/system paths). "
+                 "Install it: brew install ffmpeg (macOS), apt-get install ffmpeg (Debian/Ubuntu)."
         )]
 
     video_dir = os.path.join(screenshot_dir, "video")
