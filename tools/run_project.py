@@ -3,6 +3,7 @@ run_solar2d_project tool - Run a Solar2D project in the simulator.
 """
 
 import os
+import platform
 import signal
 import subprocess
 import tempfile
@@ -922,13 +923,16 @@ async def handle(arguments: dict) -> list[TextContent]:
     # Build the command
     cmd = [simulator_path]
 
-    if no_console:
-        cmd.extend(["-no-console", "YES"])
-
-    if debug:
-        cmd.extend(["-debug", "1"])
-
-    cmd.extend(["-project", main_lua_path])
+    if platform.system() == "Darwin":
+        # Only macOS reads these, through NSUserDefaults.
+        if no_console:
+            cmd.extend(["-no-console", "YES"])
+        if debug:
+            cmd.extend(["-debug", "1"])
+        cmd.extend(["-project", main_lua_path])
+    else:
+        # Elsewhere the path is positional, and a flag's value gets taken as it.
+        cmd.append(main_lua_path)
 
     try:
         # Run the simulator (non-blocking). This MCP server uses stdio for
