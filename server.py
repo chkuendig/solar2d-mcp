@@ -11,6 +11,7 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Resource, Tool
 
 from resources import RESOURCES, read_resource
+from runtime import shutdown_runtime
 from tools import TOOLS, call_tool
 
 # Initialize the MCP server
@@ -42,13 +43,18 @@ async def handle_read_resource(uri: str) -> str:
 
 
 async def main():
-    """Run the MCP server."""
-    async with stdio_server() as (read_stream, write_stream):
-        await app.run(
-            read_stream,
-            write_stream,
-            app.create_initialization_options()
-        )
+    """Run the MCP server and clean up its owned simulator on disconnect."""
+    # Tool dispatch claims the slot lazily, so initialization is always
+    # healthy even while another MCP session has the simulator.
+    try:
+        async with stdio_server() as (read_stream, write_stream):
+            await app.run(
+                read_stream,
+                write_stream,
+                app.create_initialization_options()
+            )
+    finally:
+        shutdown_runtime()
 
 
 if __name__ == "__main__":
