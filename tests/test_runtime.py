@@ -53,3 +53,17 @@ def test_second_client_reports_busy_without_losing_connection(tmp_path: Path) ->
     finally:
         holder.terminate()
         holder.wait(timeout=5)
+
+
+def test_video_directory_can_be_exported(tmp_path: Path) -> None:
+    previous = os.environ.get("SOLAR2D_MCP_ARTIFACT_DIR")
+    os.environ["SOLAR2D_MCP_ARTIFACT_DIR"] = str(tmp_path)
+    try:
+        from tools.screenshot import _get_video_dir
+
+        assert Path(_get_video_dir("unused")) == tmp_path
+    finally:
+        if previous is None:
+            os.environ.pop("SOLAR2D_MCP_ARTIFACT_DIR", None)
+        else:
+            os.environ["SOLAR2D_MCP_ARTIFACT_DIR"] = previous

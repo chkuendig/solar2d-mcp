@@ -74,6 +74,9 @@ started and releases the slot; it never uses a container-wide `pkill`.
 Set `SOLAR2D_MCP_RUNTIME_DIR` when several server processes need to coordinate
 through a specific shared directory. They must see the same filesystem path.
 
+Set `SOLAR2D_MCP_ARTIFACT_DIR` to a host-mounted directory when encoded
+recordings must survive the runtime container or be uploaded by the client.
+
 
 ## First-Time Setup
 
