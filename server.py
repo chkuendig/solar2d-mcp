@@ -5,6 +5,7 @@ A Model Context Protocol server for working with Solar2D (Corona SDK) projects.
 """
 
 import asyncio
+import signal
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -57,5 +58,13 @@ async def main():
         shutdown_runtime()
 
 
+def _handle_shutdown_signal(signum, _frame) -> None:
+    """Clean up the owned simulator before a session timeout terminates us."""
+    shutdown_runtime()
+    raise SystemExit(128 + signum)
+
+
 if __name__ == "__main__":
+    for shutdown_signal in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(shutdown_signal, _handle_shutdown_signal)
     asyncio.run(main())
