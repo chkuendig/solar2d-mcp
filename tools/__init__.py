@@ -4,6 +4,7 @@ Solar2D MCP Tools - Tool definitions and dispatcher.
 
 from mcp.types import ImageContent, TextContent, Tool
 
+from runtime import simulator_busy_message
 from tools import configure, list_projects, read_logs, run_project, screenshot, social, solar_scope, state, touch, trello
 
 # Collect all tools
@@ -44,9 +45,35 @@ _HANDLERS = {
 }
 
 
+_SIMULATOR_TOOLS = frozenset({
+    "run_solar2d_project",
+    "read_solar2d_logs",
+    "list_running_projects",
+    "start_screenshot_recording",
+    "stop_screenshot_recording",
+    "get_simulator_screenshot",
+    "list_screenshots",
+    "encode_recording_video",
+    "simulate_tap",
+    "simulate_drag",
+    "find_object",
+    "get_display_info",
+    "run_solar_scope_test",
+    "rerun_solar_scope_test",
+    "get_solar_scope_result",
+    "get_game_state",
+    "run_scenario",
+    "list_scenarios",
+})
+
+
 async def call_tool(name: str, arguments: dict) -> list[TextContent | ImageContent]:
-    """Dispatch a tool call to the appropriate handler."""
+    """Dispatch a tool call without letting a busy simulator kill the connection."""
     handler = _HANDLERS.get(name)
     if handler is None:
         raise ValueError(f"Unknown tool: {name}")
+    if name in _SIMULATOR_TOOLS:
+        busy = simulator_busy_message()
+        if busy is not None:
+            return [TextContent(type="text", text=busy)]
     return await handler(arguments)

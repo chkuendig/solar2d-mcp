@@ -315,33 +315,12 @@ async def handle_run_scenario(arguments: dict) -> list[TextContent]:
     # If scenario has a random_seed, we need to restart the simulator
     # so the seed is applied at startup (Phase 1 in _mcp_state.lua)
     if setup.get("random_seed") is not None:
-        from utils import running_projects
-        from tools import run_project
-        import subprocess
-        import signal
+        from runtime import stop_tracked_simulators
 
-        main_lua_path = find_main_lua(project_path)
-        project_dir = str(Path(main_lua_path).parent)
-
-        # Kill any existing tracked simulator
-        if project_dir in running_projects:
-            old = running_projects[project_dir]
-            try:
-                os.kill(old["pid"], signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                pass
-            del running_projects[project_dir]
-
-        # Also kill any externally-running Corona Simulator processes
-        # (in case the MCP server was restarted while the sim was running)
-        try:
-            subprocess.run(
-                ["pkill", "-f", "Corona Simulator"],
-                capture_output=True,
-                timeout=5
-            )
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            pass
+        # A seeded scenario must restart the simulator, but only the process
+        # this MCP server owns. A retained runtime can host another client's
+        # server, so global pkill is never safe here.
+        stop_tracked_simulators()
 
         await asyncio.sleep(0.8)  # Give the kill time to take effect
 
