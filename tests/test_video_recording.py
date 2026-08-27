@@ -35,6 +35,11 @@ class FakeStdin:
         self.closed = True
 
 
+class ExitedSimulator:
+    def poll(self) -> int:
+        return 0
+
+
 class FakeRecorder:
     def __init__(self, returncode: int | None = None) -> None:
         self.pid = 43210
@@ -128,6 +133,36 @@ class VideoRecordingTests(unittest.TestCase):
             "log_path": str(log_path),
             "out_path": str(out_path),
         }
+
+    def test_stop_finalizes_after_simulator_exit(self) -> None:
+        self.launch["process"] = ExitedSimulator()
+        self._track_finished_recording()
+        probe = {
+            "codec": "h264",
+            "pix_fmt": "yuv420p",
+            "width": 640,
+            "height": 1390,
+            "fps": 30.0,
+            "frames": 30,
+            "duration": 1.0,
+        }
+        with (
+            mock.patch.object(video, "_find_binary", return_value="/usr/bin/ffprobe"),
+            mock.patch.object(video, "_probe_video", return_value=probe),
+        ):
+            result = asyncio.run(video.handle_stop_recording({"project_path": str(self.project)}))
+
+        self.assertIn("finalized and verified", result[0].text)
+        self.assertNotIn("video_recording", self.launch)
+
+    def test_stop_does_not_bypass_live_readiness_error(self) -> None:
+        self.launch.pop("launch_id")
+        self._track_finished_recording()
+        with mock.patch.object(video, "_finish_process") as finish_process:
+            result = asyncio.run(video.handle_stop_recording({"project_path": str(self.project)}))
+
+        self.assertIn("predates launch readiness", result[0].text)
+        finish_process.assert_not_called()
 
     def test_stop_reports_verified_playback_contract(self) -> None:
         self._track_finished_recording()

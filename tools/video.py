@@ -295,7 +295,14 @@ async def handle_stop_recording(arguments: dict) -> list[TextContent]:
         # on the live-only get_current_launch path.
         project_dir = str(Path(find_main_lua(project_path)).parent)
         stopped_launch = running_projects.get(project_dir)
-        if stopped_launch is None or stopped_launch.get("video_recording") is None:
+        process = stopped_launch.get("process") if stopped_launch is not None else None
+        if (
+            stopped_launch is None
+            or stopped_launch.get("video_recording") is None
+            or not stopped_launch.get("launch_id")
+            or process is None
+            or process.poll() is None
+        ):
             return [TextContent(type="text", text=f"Error: {error}")]
         launch = stopped_launch
     assert launch is not None

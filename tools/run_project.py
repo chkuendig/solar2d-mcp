@@ -811,23 +811,35 @@ print("[MCP Touch Overlay] Initialized - persistent visual indicators enabled")
 def inject_module_into_main_lua(main_lua_path: str, module_name: str) -> bool:
     """Inject a require statement into main.lua if not already present."""
     try:
-        with open(main_lua_path, 'r') as f:
-            content = f.read()
+        # Work in bytes so cancellation can remove our line without changing
+        # the project's original encoding or newline convention (notably CRLF
+        # projects on Linux).
+        path = Path(main_lua_path)
+        content = path.read_bytes()
 
         require_str = f'require("{module_name}")'
         require_str_single = f"require('{module_name}')"
 
         # Check if already injected
-        if require_str in content or require_str_single in content:
+        if require_str.encode() in content or require_str_single.encode() in content:
             return False  # Already present
 
-        lines = content.split('\n')
+        lines = content.splitlines(keepends=True)
+        line_text = [line.rstrip(b'\r\n').decode('utf-8', 'replace') for line in lines]
+        if b'\r\n' in content:
+            newline = b'\r\n'
+        elif b'\n' in content:
+            newline = b'\n'
+        elif b'\r' in content:
+            newline = b'\r'
+        else:
+            newline = b'\n'
 
         # Find the best insertion point
         # Look for mobdebug line, or first require, or beginning
         insert_index = 0
 
-        for i, line in enumerate(lines):
+        for i, line in enumerate(line_text):
             # Insert after mobdebug if present
             if 'mobdebug' in line.lower() and 'require' in line:
                 insert_index = i + 1
@@ -839,18 +851,17 @@ def inject_module_into_main_lua(main_lua_path: str, module_name: str) -> bool:
 
         # If no requires found, insert after initial comments/blank lines
         if insert_index == 0:
-            for i, line in enumerate(lines):
+            for i, line in enumerate(line_text):
                 stripped = line.strip()
                 if stripped and not stripped.startswith('--'):
                     insert_index = i
                     break
 
         # Insert the require line
-        lines.insert(insert_index, f'{require_str}  -- Auto-injected by MCP server')
+        lines.insert(insert_index, f'{require_str}  -- Auto-injected by MCP server'.encode() + newline)
 
         # Write back to file
-        with open(main_lua_path, 'w') as f:
-            f.write('\n'.join(lines))
+        path.write_bytes(b''.join(lines))
 
         return True  # Successfully injected
 
@@ -987,8 +998,15 @@ def _remove_injected_module(main_lua_path: str, module_name: str) -> None:
         f"require('{module_name}')  -- Auto-injected by MCP server for log capture",
     }
     lines = content.splitlines(keepends=True)
-    filtered = [line for line in lines if line.rstrip(b"\r\n").decode("utf-8", "replace") not in injected_lines]
-    if len(filtered) == len(lines):
+    removed = False
+    filtered = []
+    for line in lines:
+        line_text = line.rstrip(b"\r\n").decode("utf-8", "replace")
+        if not removed and line_text in injected_lines:
+            removed = True
+            continue
+        filtered.append(line)
+    if not removed:
         return
     path.write_bytes(b"".join(filtered))
 
@@ -1018,8 +1036,10 @@ def _stop_launch(launch: dict) -> None:
         if process is not None:
             stop_process(process)
     finally:
-        _restore_launch_artifacts(launch)
-        _remove_launch_ipc(launch)
+        try:
+            _restore_launch_artifacts(launch)
+        finally:
+            _remove_launch_ipc(launch)
 
 
 def _prepare_and_spawn(
@@ -1060,11 +1080,17 @@ def _prepare_and_spawn(
 
     try:
         create_logging_wrapper(project_dir, log_file)
+        logger_path = _helper_paths(project_dir)["logger"]
+        launch["generated_helpers"][logger_path] = Path(logger_path).read_bytes()
         create_screenshot_module(project_dir, project_name, launch_id)
+        screenshot_path = _helper_paths(project_dir)["screenshot"]
+        launch["generated_helpers"][screenshot_path] = Path(screenshot_path).read_bytes()
         create_touch_module(project_dir, project_name, launch_id)
+        touch_path = _helper_paths(project_dir)["touch"]
+        launch["generated_helpers"][touch_path] = Path(touch_path).read_bytes()
         create_touch_overlay_module(project_dir)
-        for path in _helper_paths(project_dir).values():
-            launch["generated_helpers"][path] = Path(path).read_bytes()
+        overlay_path = _helper_paths(project_dir)["touch_overlay"]
+        launch["generated_helpers"][overlay_path] = Path(overlay_path).read_bytes()
 
         launch["logger_injected"] = inject_module_into_main_lua(main_lua_path, "_mcp_logger")
         launch["screenshot_injected"] = inject_module_into_main_lua(main_lua_path, "_mcp_screenshot")
@@ -1092,6 +1118,12 @@ def _prepare_and_spawn(
 
         return launch
     except Exception:
+        # A helper generator may fail after writing its file. Capture any such
+        # partial output before rollback so newly-created files are removed and
+        # pre-existing files are restored safely.
+        for path in _helper_paths(project_dir).values():
+            if path not in launch["generated_helpers"] and Path(path).exists():
+                launch["generated_helpers"][path] = Path(path).read_bytes()
         _stop_launch(launch)
         raise
 

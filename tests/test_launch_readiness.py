@@ -324,6 +324,76 @@ class LaunchReadinessTests(unittest.TestCase):
         self.assertEqual(launch["launch_id"], prepare_calls[0])
         self.assertIn(f"Launch ID: {launch['launch_id']}", successes[0])
 
+    def test_injected_require_rollback_preserves_crlf_and_user_duplicate(self) -> None:
+        project = make_project(self.tmp_path)
+        main_lua = project / "main.lua"
+        original = b"-- header\r\nprint('test')\r\n"
+        main_lua.write_bytes(original)
+
+        self.assertTrue(run_project.inject_module_into_main_lua(str(main_lua), "_mcp_touch"))
+        injected = b'require("_mcp_touch")  -- Auto-injected by MCP server\r\n'
+        after_injection = main_lua.read_bytes()
+        self.assertFalse(run_project.inject_module_into_main_lua(str(main_lua), "_mcp_touch"))
+        self.assertEqual(main_lua.read_bytes(), after_injection)
+        self.assertEqual(main_lua.read_bytes(), b"-- header\r\n" + injected + b"print('test')\r\n")
+
+        # A user edit that adds the same text must survive cleanup; only the
+        # line inserted by this launch is owned by the MCP server.
+        main_lua.write_bytes(main_lua.read_bytes() + injected)
+        run_project._remove_injected_module(str(main_lua), "_mcp_touch")
+        self.assertEqual(main_lua.read_bytes(), original + injected)
+
+    def test_helper_rollback_restores_original_and_preserves_user_edits(self) -> None:
+        project = make_project(self.tmp_path)
+        restored = project / "_mcp_logger.lua"
+        created = project / "_mcp_screenshot.lua"
+        original = b"user logger\r\n"
+        generated = b"generated logger\n"
+        restored.write_bytes(generated)
+        created.write_bytes(b"user-edited generated screenshot")
+        launch = {
+            "main_lua": str(project / "main.lua"),
+            "helper_backups": {str(restored): original, str(created): None},
+            "generated_helpers": {str(restored): generated, str(created): b"generated screenshot"},
+        }
+
+        run_project._restore_launch_artifacts(launch)
+
+        self.assertEqual(restored.read_bytes(), original)
+        self.assertEqual(created.read_bytes(), b"user-edited generated screenshot")
+
+    def test_partial_helper_failure_rolls_back_created_files(self) -> None:
+        project = make_project(self.tmp_path)
+        logger = project / "_mcp_logger.lua"
+        screenshot = project / "_mcp_screenshot.lua"
+
+        def create_logger(project_dir: str, log_file: str) -> str:
+            logger.write_bytes(b"generated logger")
+            return str(logger)
+
+        def fail_after_writing(project_dir: str, project_name: str, launch_id: str) -> str:
+            screenshot.write_bytes(b"partial screenshot")
+            raise RuntimeError("generator failed")
+
+        with (
+            mock.patch.object(run_project, "stop_tracked_simulators"),
+            mock.patch.object(run_project, "create_logging_wrapper", side_effect=create_logger),
+            mock.patch.object(run_project, "create_screenshot_module", side_effect=fail_after_writing),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "generator failed"):
+                run_project._prepare_and_spawn(
+                    cmd=[],
+                    project_dir=str(project),
+                    project_name="project",
+                    main_lua_path=str(project / "main.lua"),
+                    log_file=str(self.tmp_path / "corona.log"),
+                    launch_id="failed-launch",
+                    cancelled=threading.Event(),
+                )
+
+        self.assertFalse(logger.exists())
+        self.assertFalse(screenshot.exists())
+
     def test_cleanup_is_process_and_launch_scoped(self) -> None:
         first_project = make_project(self.tmp_path / "first")
         second_project = make_project(self.tmp_path / "second")
