@@ -281,8 +281,16 @@ class LaunchReadinessTests(unittest.TestCase):
             started = time.monotonic()
             await asyncio.to_thread(invocation_barrier.wait, 0.5)
             entered = await asyncio.to_thread(worker_entered.wait, 0.5)
-            self.assertTrue(entered, "winning launch never entered its worker")
-            release_worker.set()
+            try:
+                self.assertTrue(entered, "winning launch never entered its worker")
+                done, _ = await asyncio.wait(
+                    calls,
+                    timeout=0.5,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                self.assertEqual(len(done), 1, "overlapping launch did not return promptly")
+            finally:
+                release_worker.set()
             results = await asyncio.wait_for(asyncio.gather(*calls), timeout=1)
             return results, time.monotonic() - started
 
