@@ -71,6 +71,11 @@ connected and receive a `Solar2D runtime is busy` response until the owner
 disconnects. On disconnect, the server stops only simulator processes it
 started and releases the slot; it never uses a container-wide `pkill`.
 
+Launch requests within one MCP server are also serialized through readiness.
+If another run request overlaps setup or readiness, it receives a prompt
+`launch is already in progress` error while the MCP connection stays healthy.
+Only the winning launch can own the tracked simulator.
+
 Set `SOLAR2D_MCP_RUNTIME_DIR` when several server processes need to coordinate
 through a specific shared directory. They must see the same filesystem path.
 
@@ -263,6 +268,10 @@ The MCP server can capture screenshots from the running simulator for visual ana
 Screenshots are saved to: `/tmp/solar2d_screenshots_<project-name>_<launch-id>/`
 
 Each launch gets a separate directory; screenshots persist across recording sessions within that run.
+
+Simulator screenshot references used by `preview_social_post` (`latest`,
+`last`, or a number) resolve only inside the currently tracked launch's
+directory. An inactive project returns an error instead of using older files.
 
 ### Recording Workflow
 

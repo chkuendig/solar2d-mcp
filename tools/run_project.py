@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 from mcp.types import TextContent, Tool
@@ -22,6 +23,9 @@ from utils import find_main_lua, running_projects
 
 LAUNCH_TIMEOUT_SECONDS = 20.0
 READINESS_POLL_SECONDS = 0.05
+_launch_lock: asyncio.Lock | None = None
+_launch_lock_loop: asyncio.AbstractEventLoop | None = None
+
 
 TOOL = Tool(
     name="run_solar2d_project",
@@ -907,6 +911,16 @@ class _LaunchCancelled(Exception):
     """Preparation was abandoned before its process could be handed off."""
 
 
+def _get_launch_lock() -> asyncio.Lock:
+    """Return the launch mutex for this MCP server event loop."""
+    global _launch_lock, _launch_lock_loop
+    loop = asyncio.get_running_loop()
+    if _launch_lock is None or _launch_lock_loop is not loop:
+        _launch_lock = asyncio.Lock()
+        _launch_lock_loop = loop
+    return _launch_lock
+
+
 def _launch_paths(project_name: str, launch_id: str) -> dict[str, str]:
     launch_name = f"{project_name}_{launch_id}"
     temp_dir = tempfile.gettempdir()
@@ -947,6 +961,9 @@ def _prepare_and_spawn(
     cancelled: threading.Event,
 ) -> dict:
     """Perform blocking file/process work away from the MCP event loop."""
+    if cancelled.is_set():
+        raise _LaunchCancelled
+
     previous_launches = list(running_projects.values())
     stop_tracked_simulators()
     for previous in previous_launches:
@@ -1034,21 +1051,35 @@ async def _cleanup_launch(launch: dict) -> None:
     await asyncio.to_thread(_stop_launch, launch)
 
 
-def _abandon_preparation(task: asyncio.Task, cancelled: threading.Event) -> None:
+def _abandon_preparation(
+    task: asyncio.Task,
+    cancelled: threading.Event,
+    finished: Callable[[], None],
+) -> None:
     """Ensure a worker that outlives its caller cannot leak a simulator."""
     cancelled.set()
 
     def cleanup_if_spawned(done: asyncio.Task) -> None:
-        try:
-            launch = done.result()
-        except (Exception, asyncio.CancelledError):
-            return
-        asyncio.create_task(_cleanup_launch(launch))
+        async def finish_abandoned_launch() -> None:
+            try:
+                launch = done.result()
+            except (Exception, asyncio.CancelledError):
+                pass
+            else:
+                await _cleanup_launch(launch)
+            finally:
+                finished()
+
+        asyncio.create_task(finish_abandoned_launch())
 
     task.add_done_callback(cleanup_if_spawned)
 
 
-async def handle(arguments: dict) -> list[TextContent]:
+async def _handle_owned_launch(
+    arguments: dict,
+    abandon: Callable[[asyncio.Task, threading.Event], None],
+    release_after: Callable[[asyncio.Task], None],
+) -> list[TextContent]:
     """Handle run_solar2d_project tool call."""
     project_path = arguments.get("project_path")
     debug = arguments.get("debug", True)
@@ -1129,7 +1160,7 @@ async def handle(arguments: dict) -> list[TextContent]:
             timeout=max(0, deadline - loop.time()),
         )
     except asyncio.TimeoutError:
-        _abandon_preparation(preparation, cancelled)
+        abandon(preparation, cancelled)
         return [TextContent(
             type="text",
             text=(
@@ -1139,7 +1170,7 @@ async def handle(arguments: dict) -> list[TextContent]:
             ),
         )]
     except asyncio.CancelledError:
-        _abandon_preparation(preparation, cancelled)
+        abandon(preparation, cancelled)
         raise
     except _LaunchCancelled:
         return [TextContent(type="text", text="Error: Solar2D launch was cancelled during setup.")]
@@ -1153,11 +1184,16 @@ async def handle(arguments: dict) -> list[TextContent]:
     try:
         readiness, return_code = await _wait_for_launch(launch, deadline)
     except asyncio.CancelledError:
-        await asyncio.shield(_cleanup_launch(launch))
+        release_after(asyncio.create_task(_cleanup_launch(launch)))
         raise
 
     if readiness != "ready":
-        await _cleanup_launch(launch)
+        cleanup = asyncio.create_task(_cleanup_launch(launch))
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            release_after(cleanup)
+            raise
         if readiness == "exited":
             detail = f"exited with code {return_code}"
         else:
@@ -1198,3 +1234,39 @@ async def handle(arguments: dict) -> list[TextContent]:
             "Use start_screenshot_recording to capture screenshots."
         ),
     )]
+
+
+async def handle(arguments: dict) -> list[TextContent]:
+    """Serialize launch ownership without blocking the MCP event loop."""
+    launch_lock = _get_launch_lock()
+    if launch_lock.locked():
+        return [TextContent(
+            type="text",
+            text=(
+                "Error: Another Solar2D launch is already in progress in this MCP server. "
+                "The MCP connection is healthy; retry after that launch finishes."
+            ),
+        )]
+
+    await launch_lock.acquire()
+    handed_off = False
+
+    def release_after(task: asyncio.Task) -> None:
+        nonlocal handed_off
+        handed_off = True
+        task.add_done_callback(lambda _: launch_lock.release())
+
+    def abandon(preparation: asyncio.Task, cancelled: threading.Event) -> None:
+        nonlocal handed_off
+        handed_off = True
+        _abandon_preparation(preparation, cancelled, launch_lock.release)
+
+    try:
+        return await _handle_owned_launch(
+            arguments,
+            abandon=abandon,
+            release_after=release_after,
+        )
+    finally:
+        if not handed_off:
+            launch_lock.release()
