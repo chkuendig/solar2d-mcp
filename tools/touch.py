@@ -3,25 +3,24 @@ Touch simulation tools - Simulate taps on the Solar2D simulator.
 """
 
 import json
-import os
-import tempfile
 from pathlib import Path
 
 from mcp.types import TextContent, Tool
 
-from utils import find_main_lua
+from utils import get_current_launch, write_launch_control
 
 # Duration in seconds for auto-recording on each interaction
 AUTO_RECORD_SECONDS = 3
 
 
-def _start_auto_recording(project_name: str):
+def _start_auto_recording(launch: dict) -> None:
     """Start a short screenshot recording to capture interaction visuals."""
-    control_file = os.path.join(
-        tempfile.gettempdir(), f"solar2d_screenshots_{project_name}.control"
+    write_launch_control(
+        launch["screenshot_control_file"],
+        launch["launch_id"],
+        str(AUTO_RECORD_SECONDS),
     )
-    with open(control_file, 'w') as f:
-        f.write(str(AUTO_RECORD_SECONDS))
+
 
 # Tool definitions
 SIMULATE_TAP_TOOL = Tool(
@@ -163,21 +162,34 @@ SIMULATE_DRAG_TOOL = Tool(
 TOOLS = [SIMULATE_TAP_TOOL, SIMULATE_DRAG_TOOL, FIND_OBJECT_TOOL, GET_DISPLAY_INFO_TOOL]
 
 
-def _get_project_name(project_path: str) -> str:
-    """Get the project name from the path."""
-    main_lua_path = find_main_lua(project_path)
-    project_dir = str(Path(main_lua_path).parent)
-    return Path(project_dir).name
+def _read_current_display_info(
+    project_path: str,
+) -> tuple[dict | None, dict | None, str | None]:
+    launch, error = get_current_launch(project_path)
+    if error:
+        return None, None, error
+    assert launch is not None
 
+    info_path = Path(launch["display_info_file"])
+    try:
+        stat = info_path.stat()
+        with info_path.open() as file:
+            info = json.load(file)
+    except FileNotFoundError:
+        return launch, None, "Current-launch display readiness was not found. Run the project again."
+    except (OSError, json.JSONDecodeError) as exc:
+        return launch, None, f"Error reading current-launch display info: {exc}"
 
-def _get_control_file(project_name: str) -> str:
-    """Get the touch control file path."""
-    return os.path.join(tempfile.gettempdir(), f"solar2d_touch_{project_name}.control")
+    if (
+        info.get("launchId") != launch["launch_id"]
+        or stat.st_mtime_ns < launch["started_at_ns"]
+    ):
+        return launch, None, (
+            "Rejected stale display info that does not belong to the current live launch. "
+            "Run the project again."
+        )
 
-
-def _get_info_file(project_name: str) -> str:
-    """Get the display info output file path."""
-    return os.path.join(tempfile.gettempdir(), f"solar2d_display_{project_name}.json")
+    return launch, info, None
 
 
 async def handle_simulate_tap(arguments: dict) -> list[TextContent]:
@@ -194,42 +206,29 @@ async def handle_simulate_tap(arguments: dict) -> list[TextContent]:
     if None in (left, right, top, bottom):
         return [TextContent(type="text", text="Error: left, right, top, bottom are all required")]
 
-    project_name = _get_project_name(project_path)
-    control_file = _get_control_file(project_name)
-    info_file = _get_info_file(project_name)
+    launch, info, error = _read_current_display_info(project_path)
+    if error:
+        return [TextContent(type="text", text=f"Error: {error}")]
+    assert launch is not None
+    assert info is not None
 
-    # Read display info to convert percentages to coordinates
-    if not os.path.exists(info_file):
-        return [TextContent(
-            type="text",
-            text="Display info not found. Make sure the simulator is running."
-        )]
+    content_width = info.get("contentWidth")
+    content_height = info.get("contentHeight")
+    if not content_width or not content_height:
+        return [TextContent(type="text", text="Error: Invalid display info")]
 
-    try:
-        with open(info_file, 'r') as f:
-            info = json.load(f)
-        content_width = info.get('contentWidth')
-        content_height = info.get('contentHeight')
+    x_percent = (left + right) / 2
+    y_percent = (top + bottom) / 2
+    x = int(content_width * x_percent / 100)
+    y = int(content_height * y_percent / 100)
 
-        if not content_width or not content_height:
-            return [TextContent(type="text", text="Error: Invalid display info")]
-
-        # Calculate center of bounding box and convert to pixels
-        x_percent = (left + right) / 2
-        y_percent = (top + bottom) / 2
-        x = int(content_width * x_percent / 100)
-        y = int(content_height * y_percent / 100)
-
-    except Exception as e:
-        return [TextContent(type="text", text=f"Error reading display info: {str(e)}")]
-
-    # Start auto-recording before the tap
-    _start_auto_recording(project_name)
-
-    # Write tap command to control file
+    _start_auto_recording(launch)
     command = f"tap,{x},{y}"
-    with open(control_file, 'w') as f:
-        f.write(command)
+    write_launch_control(
+        launch["touch_control_file"],
+        launch["launch_id"],
+        command,
+    )
 
     return [TextContent(
         type="text",
@@ -252,40 +251,29 @@ async def handle_find_object(arguments: dict) -> list[TextContent]:
     if None in (left, right, top, bottom):
         return [TextContent(type="text", text="Error: left, right, top, bottom are all required")]
 
-    project_name = _get_project_name(project_path)
-    control_file = _get_control_file(project_name)
-    info_file = _get_info_file(project_name)
+    launch, info, error = _read_current_display_info(project_path)
+    if error:
+        return [TextContent(type="text", text=f"Error: {error}")]
+    assert launch is not None
+    assert info is not None
 
-    if not os.path.exists(info_file):
-        return [TextContent(
-            type="text",
-            text="Display info not found. Make sure the simulator is running."
-        )]
+    content_width = info.get("contentWidth")
+    content_height = info.get("contentHeight")
+    if not content_width or not content_height:
+        return [TextContent(type="text", text="Error: Invalid display info")]
 
-    try:
-        with open(info_file, 'r') as f:
-            info = json.load(f)
-        content_width = info.get('contentWidth')
-        content_height = info.get('contentHeight')
+    x1 = int(content_width * left / 100)
+    y1 = int(content_height * top / 100)
+    x2 = int(content_width * right / 100)
+    y2 = int(content_height * bottom / 100)
 
-        if not content_width or not content_height:
-            return [TextContent(type="text", text="Error: Invalid display info")]
-
-        x1 = int(content_width * left / 100)
-        y1 = int(content_height * top / 100)
-        x2 = int(content_width * right / 100)
-        y2 = int(content_height * bottom / 100)
-
-    except Exception as e:
-        return [TextContent(type="text", text=f"Error reading display info: {str(e)}")]
-
-    # Start auto-recording before the find
-    _start_auto_recording(project_name)
-
-    # Write find command to control file
+    _start_auto_recording(launch)
     command = f"find,{x1},{y1},{x2},{y2},{label}"
-    with open(control_file, 'w') as f:
-        f.write(command)
+    write_launch_control(
+        launch["touch_control_file"],
+        launch["launch_id"],
+        command,
+    )
 
     label_msg = f" label=\"{label}\"" if label else ""
     return [TextContent(
@@ -314,48 +302,34 @@ async def handle_simulate_drag(arguments: dict) -> list[TextContent]:
                 end_left, end_right, end_top, end_bottom):
         return [TextContent(type="text", text="Error: all start and end bounding box parameters are required")]
 
-    project_name = _get_project_name(project_path)
-    control_file = _get_control_file(project_name)
-    info_file = _get_info_file(project_name)
+    launch, info, error = _read_current_display_info(project_path)
+    if error:
+        return [TextContent(type="text", text=f"Error: {error}")]
+    assert launch is not None
+    assert info is not None
 
-    # Read display info to convert percentages to coordinates
-    if not os.path.exists(info_file):
-        return [TextContent(
-            type="text",
-            text="Display info not found. Make sure the simulator is running."
-        )]
+    content_width = info.get("contentWidth")
+    content_height = info.get("contentHeight")
+    if not content_width or not content_height:
+        return [TextContent(type="text", text="Error: Invalid display info")]
 
-    try:
-        with open(info_file, 'r') as f:
-            info = json.load(f)
-        content_width = info.get('contentWidth')
-        content_height = info.get('contentHeight')
+    sx_percent = (start_left + start_right) / 2
+    sy_percent = (start_top + start_bottom) / 2
+    x1 = int(content_width * sx_percent / 100)
+    y1 = int(content_height * sy_percent / 100)
 
-        if not content_width or not content_height:
-            return [TextContent(type="text", text="Error: Invalid display info")]
+    ex_percent = (end_left + end_right) / 2
+    ey_percent = (end_top + end_bottom) / 2
+    x2 = int(content_width * ex_percent / 100)
+    y2 = int(content_height * ey_percent / 100)
 
-        # Calculate center of start bounding box
-        sx_percent = (start_left + start_right) / 2
-        sy_percent = (start_top + start_bottom) / 2
-        x1 = int(content_width * sx_percent / 100)
-        y1 = int(content_height * sy_percent / 100)
-
-        # Calculate center of end bounding box
-        ex_percent = (end_left + end_right) / 2
-        ey_percent = (end_top + end_bottom) / 2
-        x2 = int(content_width * ex_percent / 100)
-        y2 = int(content_height * ey_percent / 100)
-
-    except Exception as e:
-        return [TextContent(type="text", text=f"Error reading display info: {str(e)}")]
-
-    # Start auto-recording before the drag
-    _start_auto_recording(project_name)
-
-    # Write drag command to control file
+    _start_auto_recording(launch)
     command = f"drag,{x1},{y1},{x2},{y2},{int(duration)}"
-    with open(control_file, 'w') as f:
-        f.write(command)
+    write_launch_control(
+        launch["touch_control_file"],
+        launch["launch_id"],
+        command,
+    )
 
     return [TextContent(
         type="text",
@@ -370,29 +344,19 @@ async def handle_get_display_info(arguments: dict) -> list[TextContent]:
     if not project_path:
         return [TextContent(type="text", text="Error: project_path is required")]
 
-    project_name = _get_project_name(project_path)
-    info_file = _get_info_file(project_name)
+    _, info, error = _read_current_display_info(project_path)
+    if error:
+        return [TextContent(type="text", text=f"Error: {error}")]
+    assert info is not None
 
-    if not os.path.exists(info_file):
-        return [TextContent(
-            type="text",
-            text="Display info not found. Make sure the simulator is running (info is written on startup)."
-        )]
-
-    try:
-        with open(info_file, 'r') as f:
-            info = json.load(f)
-
-        lines = [
-            "Solar2D Display Info:",
-            "",
-            f"Content Size: {info.get('contentWidth', '?')} x {info.get('contentHeight', '?')}",
-            f"Actual Content Size: {info.get('actualContentWidth', '?')} x {info.get('actualContentHeight', '?')}",
-            f"Screen Origin: ({info.get('screenOriginX', '?')}, {info.get('screenOriginY', '?')})",
-            "",
-            "Note: Screenshots are captured at content size.",
-            "Tap coordinates should be in content space (0,0 is top-left of content area)."
-        ]
-        return [TextContent(type="text", text="\n".join(lines))]
-    except Exception as e:
-        return [TextContent(type="text", text=f"Error reading display info: {str(e)}")]
+    lines = [
+        "Solar2D Display Info:",
+        "",
+        f"Content Size: {info.get('contentWidth', '?')} x {info.get('contentHeight', '?')}",
+        f"Actual Content Size: {info.get('actualContentWidth', '?')} x {info.get('actualContentHeight', '?')}",
+        f"Screen Origin: ({info.get('screenOriginX', '?')}, {info.get('screenOriginY', '?')})",
+        "",
+        "Note: Screenshots are captured at content size.",
+        "Tap coordinates should be in content space (0,0 is top-left of content area)."
+    ]
+    return [TextContent(type="text", text="\n".join(lines))]

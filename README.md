@@ -111,7 +111,8 @@ Assistant: [calls configure_solar2d(confirm=true)]
 - `run_solar2d_project` - Run a Solar2D project in the simulator
   - Accepts project directory or main.lua path
   - Optional debug and console flags
-  - Launches simulator in background
+  - Launches simulator in background and returns after fresh instrumentation is ready
+  - Fails within 20 seconds if the child exits or current-launch readiness is not published
   - Injects logger that captures all print() output
 - `read_solar2d_logs` - Read console logs from running Solar2D Simulator
   - View all Lua print() statements from your game code
@@ -259,9 +260,9 @@ The MCP server can capture screenshots from the running simulator for visual ana
 
 ### Screenshot Location
 
-Screenshots are saved to: `/tmp/solar2d_screenshots_<project-name>/`
+Screenshots are saved to: `/tmp/solar2d_screenshots_<project-name>_<launch-id>/`
 
-The directory is cleared when the simulator starts, but screenshots persist across recording sessions within the same run.
+Each launch gets a separate directory; screenshots persist across recording sessions within that run.
 
 ### Recording Workflow
 

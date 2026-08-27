@@ -7,13 +7,12 @@ import base64
 import os
 import re
 import shutil
-import tempfile
 import uuid
 from pathlib import Path
 
 from mcp.types import ImageContent, TextContent, Tool
 
-from utils import find_main_lua
+from utils import get_current_launch, write_launch_control
 
 # Hard ceiling on a single recording, mirrored in the injected capture loop
 # (run_project.py: MAX_RECORDING_SECONDS). The Lua loop enforces it too, so a
@@ -137,29 +136,12 @@ TOOLS = [START_RECORDING_TOOL, STOP_RECORDING_TOOL, GET_SCREENSHOT_TOOL, LIST_SC
 RECORDED = re.compile(r"^screenshot_\d+\.jpg$")
 
 
-def _get_project_name(project_path: str) -> str:
-    """Get the project name from the path."""
-    main_lua_path = find_main_lua(project_path)
-    project_dir = str(Path(main_lua_path).parent)
-    return Path(project_dir).name
-
-
-def _get_screenshot_dir(project_name: str) -> str:
-    """Get the screenshot directory path."""
-    return os.path.join(tempfile.gettempdir(), f"solar2d_screenshots_{project_name}")
-
-
 def _get_video_dir(screenshot_dir: str) -> str:
     """Return a host-exportable video directory when one is configured."""
     artifact_dir = os.environ.get("SOLAR2D_MCP_ARTIFACT_DIR")
     if artifact_dir:
         return os.path.abspath(os.path.expanduser(artifact_dir))
     return os.path.join(screenshot_dir, "video")
-
-
-def _get_control_file(project_name: str) -> str:
-    """Get the control file path."""
-    return os.path.join(tempfile.gettempdir(), f"solar2d_screenshots_{project_name}.control")
 
 
 def _find_ffmpeg() -> str | None:
@@ -181,20 +163,23 @@ async def handle_start_recording(arguments: dict) -> list[TextContent]:
     if not project_path:
         return [TextContent(type="text", text="Error: project_path is required")]
 
-    project_name = _get_project_name(project_path)
-    control_file = _get_control_file(project_name)
-    screenshot_dir = _get_screenshot_dir(project_name)
+    launch, error = get_current_launch(project_path)
+    if error:
+        return [TextContent(type="text", text=f"Error: {error}")]
+    assert launch is not None
 
     # Cap duration at the hard ceiling (the Lua loop enforces it too).
     duration = min(int(duration), MAX_RECORDING_SECONDS)
 
-    # Write duration to control file
-    with open(control_file, 'w') as f:
-        f.write(str(duration))
+    write_launch_control(
+        launch["screenshot_control_file"],
+        launch["launch_id"],
+        str(duration),
+    )
 
     return [TextContent(
         type="text",
-        text=f"Screenshot recording started!\n\nDuration: {duration} seconds\nInterval: 100ms (10 fps)\nScreenshots will be saved to: {screenshot_dir}\n\nUse get_simulator_screenshot to view captured images.\nUse stop_screenshot_recording to stop early."
+        text=f"Screenshot recording started!\n\nDuration: {duration} seconds\nInterval: 100ms (10 fps)\nScreenshots will be saved to: {launch['screenshot_dir']}\n\nUse get_simulator_screenshot to view captured images.\nUse stop_screenshot_recording to stop early."
     )]
 
 
@@ -205,12 +190,16 @@ async def handle_stop_recording(arguments: dict) -> list[TextContent]:
     if not project_path:
         return [TextContent(type="text", text="Error: project_path is required")]
 
-    project_name = _get_project_name(project_path)
-    control_file = _get_control_file(project_name)
+    launch, error = get_current_launch(project_path)
+    if error:
+        return [TextContent(type="text", text=f"Error: {error}")]
+    assert launch is not None
 
-    # Write 0 to control file to stop recording
-    with open(control_file, 'w') as f:
-        f.write("0")
+    write_launch_control(
+        launch["screenshot_control_file"],
+        launch["launch_id"],
+        "0",
+    )
 
     return [TextContent(
         type="text",
@@ -226,9 +215,11 @@ async def handle_get_screenshot(arguments: dict) -> list[TextContent | ImageCont
     if not project_path:
         return [TextContent(type="text", text="Error: project_path is required")]
 
-    project_name = _get_project_name(project_path)
-    screenshot_dir = _get_screenshot_dir(project_name)
-    control_file = _get_control_file(project_name)
+    launch, error = get_current_launch(project_path)
+    if error:
+        return [TextContent(type="text", text=f"Error: {error}")]
+    assert launch is not None
+    screenshot_dir = launch["screenshot_dir"]
 
     # Handle "latest" - capture fresh screenshot on demand
     if which == "latest":
@@ -239,8 +230,11 @@ async def handle_get_screenshot(arguments: dict) -> list[TextContent | ImageCont
         # capture is done and written. The leading letter keeps it out of
         # RECORDED, which an all-digit token would otherwise match.
         token = "x" + uuid.uuid4().hex[:11]
-        with open(control_file, 'w') as f:
-            f.write(f"now:{token}")
+        write_launch_control(
+            launch["screenshot_control_file"],
+            launch["launch_id"],
+            f"now:{token}",
+        )
 
         target = os.path.join(screenshot_dir, f"screenshot_{token}.jpg")
 
@@ -371,8 +365,11 @@ async def handle_encode_video(arguments: dict) -> list[TextContent]:
     if not filename.lower().endswith(".mp4"):
         filename += ".mp4"
 
-    project_name = _get_project_name(project_path)
-    screenshot_dir = _get_screenshot_dir(project_name)
+    launch, error = get_current_launch(project_path)
+    if error:
+        return [TextContent(type="text", text=f"Error: {error}")]
+    assert launch is not None
+    screenshot_dir = launch["screenshot_dir"]
     if not os.path.exists(screenshot_dir):
         return [TextContent(
             type="text",
@@ -460,8 +457,11 @@ async def handle_list_screenshots(arguments: dict) -> list[TextContent]:
     if not project_path:
         return [TextContent(type="text", text="Error: project_path is required")]
 
-    project_name = _get_project_name(project_path)
-    screenshot_dir = _get_screenshot_dir(project_name)
+    launch, error = get_current_launch(project_path)
+    if error:
+        return [TextContent(type="text", text=f"Error: {error}")]
+    assert launch is not None
+    screenshot_dir = launch["screenshot_dir"]
 
     if not os.path.exists(screenshot_dir):
         return [TextContent(
