@@ -157,9 +157,41 @@ def _stop_process(process: Any, timeout: float = 2.0) -> None:
         pass
 
 
+def _finish_recording_process(process: Any, timeout: float = 8.0) -> None:
+    """Ask ffmpeg to finalize its container before falling back to termination."""
+    if process.poll() is not None:
+        return
+
+    stdin = getattr(process, "stdin", None)
+    if stdin is None:
+        _stop_process(process)
+        return
+    try:
+        try:
+            stdin.write(b"q\n")
+        except TypeError:
+            stdin.write("q\n")
+        stdin.flush()
+        process.wait(timeout=timeout)
+    except Exception:
+        _stop_process(process)
+    finally:
+        try:
+            stdin.close()
+        except OSError:
+            pass
+
+
 def stop_tracked_simulators() -> None:
     """Stop only simulator processes this MCP server launched and recorded."""
     for project in list(running_projects.values()):
+        recording = project.pop("video_recording", None)
+        if recording is not None:
+            _finish_recording_process(recording["process"])
+            log_handle = recording.get("log_handle")
+            if log_handle is not None and not log_handle.closed:
+                log_handle.close()
+            Path(recording["log_path"]).unlink(missing_ok=True)
         process = project.get("process")
         if process is not None:
             _stop_process(process)
