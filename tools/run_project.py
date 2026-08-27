@@ -943,11 +943,83 @@ def _remove_launch_ipc(launch: dict) -> None:
         path.with_name(f"{path.name}.pending").unlink(missing_ok=True)
 
 
+def _helper_paths(project_dir: str) -> dict[str, str]:
+    """Return helper files owned by this launch."""
+    return {
+        "logger": os.path.join(project_dir, "_mcp_logger.lua"),
+        "screenshot": os.path.join(project_dir, "_mcp_screenshot.lua"),
+        "touch": os.path.join(project_dir, "_mcp_touch.lua"),
+        "touch_overlay": os.path.join(project_dir, "_mcp_touch_overlay.lua"),
+    }
+
+
+def _snapshot_owned_file(path: str) -> bytes | None:
+    """Capture a file's pre-launch content so cancellation can restore it."""
+    file_path = Path(path)
+    if not file_path.exists():
+        return None
+    return file_path.read_bytes()
+
+
+def _restore_owned_file(path: str, original: bytes | None, generated: bytes | None) -> None:
+    """Restore an untouched helper, leaving post-launch user edits intact."""
+    file_path = Path(path)
+    if original is None:
+        if generated is not None and file_path.exists() and file_path.read_bytes() == generated:
+            file_path.unlink()
+        return
+    if generated is not None and file_path.exists() and file_path.read_bytes() == generated:
+        file_path.write_bytes(original)
+
+
+def _remove_injected_module(main_lua_path: str, module_name: str) -> None:
+    """Remove one auto-injected require line without touching user code."""
+    path = Path(main_lua_path)
+    try:
+        content = path.read_bytes()
+    except OSError:
+        return
+
+    injected_lines = {
+        f'require("{module_name}")  -- Auto-injected by MCP server',
+        f"require('{module_name}')  -- Auto-injected by MCP server",
+        f'require("{module_name}")  -- Auto-injected by MCP server for log capture',
+        f"require('{module_name}')  -- Auto-injected by MCP server for log capture",
+    }
+    lines = content.splitlines(keepends=True)
+    filtered = [line for line in lines if line.rstrip(b"\r\n").decode("utf-8", "replace") not in injected_lines]
+    if len(filtered) == len(lines):
+        return
+    path.write_bytes(b"".join(filtered))
+
+
+def _restore_launch_artifacts(launch: dict) -> None:
+    """Undo only the helper files and require lines created for this launch."""
+    main_lua_path = launch.get("main_lua")
+    if main_lua_path:
+        for flag, module_name in (
+            ("logger_injected", "_mcp_logger"),
+            ("screenshot_injected", "_mcp_screenshot"),
+            ("touch_injected", "_mcp_touch"),
+            ("touch_overlay_injected", "_mcp_touch_overlay"),
+        ):
+            if launch.get(flag):
+                _remove_injected_module(main_lua_path, module_name)
+
+    helper_backups = launch.get("helper_backups") or {}
+    generated_helpers = launch.get("generated_helpers") or {}
+    for path, original in helper_backups.items():
+        _restore_owned_file(path, original, generated_helpers.get(path))
+
+
 def _stop_launch(launch: dict) -> None:
-    process = launch.get("process")
-    if process is not None:
-        stop_process(process)
-    _remove_launch_ipc(launch)
+    try:
+        process = launch.get("process")
+        if process is not None:
+            stop_process(process)
+    finally:
+        _restore_launch_artifacts(launch)
+        _remove_launch_ipc(launch)
 
 
 def _prepare_and_spawn(
@@ -977,40 +1049,51 @@ def _prepare_and_spawn(
         "project_dir": project_dir,
         "main_lua": main_lua_path,
         "log_file": log_file,
+        "helper_backups": {},
+        "generated_helpers": {},
         **_launch_paths(project_name, launch_id),
     }
     _remove_launch_ipc(launch)
 
-    create_logging_wrapper(project_dir, log_file)
-    create_screenshot_module(project_dir, project_name, launch_id)
-    create_touch_module(project_dir, project_name, launch_id)
-    create_touch_overlay_module(project_dir)
+    for path in _helper_paths(project_dir).values():
+        launch["helper_backups"][path] = _snapshot_owned_file(path)
 
-    launch["logger_injected"] = inject_module_into_main_lua(main_lua_path, "_mcp_logger")
-    launch["screenshot_injected"] = inject_module_into_main_lua(main_lua_path, "_mcp_screenshot")
-    launch["touch_injected"] = inject_module_into_main_lua(main_lua_path, "_mcp_touch")
-    inject_module_into_main_lua(main_lua_path, "_mcp_touch_overlay")
+    try:
+        create_logging_wrapper(project_dir, log_file)
+        create_screenshot_module(project_dir, project_name, launch_id)
+        create_touch_module(project_dir, project_name, launch_id)
+        create_touch_overlay_module(project_dir)
+        for path in _helper_paths(project_dir).values():
+            launch["generated_helpers"][path] = Path(path).read_bytes()
 
-    if cancelled.is_set():
-        raise _LaunchCancelled
+        launch["logger_injected"] = inject_module_into_main_lua(main_lua_path, "_mcp_logger")
+        launch["screenshot_injected"] = inject_module_into_main_lua(main_lua_path, "_mcp_screenshot")
+        launch["touch_injected"] = inject_module_into_main_lua(main_lua_path, "_mcp_touch")
+        launch["touch_overlay_injected"] = inject_module_into_main_lua(main_lua_path, "_mcp_touch_overlay")
 
-    launch["started_at_ns"] = time.time_ns()
-    process = subprocess.Popen(
-        cmd,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-        close_fds=True,
-    )
-    launch["pid"] = process.pid
-    launch["process"] = process
+        if cancelled.is_set():
+            raise _LaunchCancelled
 
-    if cancelled.is_set():
+        launch["started_at_ns"] = time.time_ns()
+        process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+        launch["pid"] = process.pid
+        launch["process"] = process
+
+        if cancelled.is_set():
+            _stop_launch(launch)
+            raise _LaunchCancelled
+
+        return launch
+    except Exception:
         _stop_launch(launch)
-        raise _LaunchCancelled
-
-    return launch
+        raise
 
 
 def _read_launch_readiness(launch: dict) -> bool:

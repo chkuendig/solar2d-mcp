@@ -15,7 +15,7 @@ from typing import Any
 from mcp.types import TextContent, Tool
 
 from runtime import _finish_recording_process
-from utils import get_current_launch
+from utils import find_main_lua, get_current_launch, running_projects
 
 MAX_RECORDING_SECONDS = 300
 MIN_FPS = 15
@@ -291,7 +291,13 @@ async def handle_stop_recording(arguments: dict) -> list[TextContent]:
 
     launch, error = get_current_launch(project_path)
     if error:
-        return [TextContent(type="text", text=f"Error: {error}")]
+        # ffmpeg can still finalize after the simulator exits; other tools stay
+        # on the live-only get_current_launch path.
+        project_dir = str(Path(find_main_lua(project_path)).parent)
+        stopped_launch = running_projects.get(project_dir)
+        if stopped_launch is None or stopped_launch.get("video_recording") is None:
+            return [TextContent(type="text", text=f"Error: {error}")]
+        launch = stopped_launch
     assert launch is not None
 
     recording = launch.pop("video_recording", None)
