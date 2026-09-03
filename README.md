@@ -71,6 +71,11 @@ connected and receive a `Solar2D runtime is busy` response until the owner
 disconnects. On disconnect, the server stops only simulator processes it
 started and releases the slot; it never uses a container-wide `pkill`.
 
+Launch requests within one MCP server are also serialized through readiness.
+If another run request overlaps setup or readiness, it receives a prompt
+`launch is already in progress` error while the MCP connection stays healthy.
+Only the winning launch can own the tracked simulator.
+
 Set `SOLAR2D_MCP_RUNTIME_DIR` when several server processes need to coordinate
 through a specific shared directory. They must see the same filesystem path.
 
@@ -111,7 +116,8 @@ Assistant: [calls configure_solar2d(confirm=true)]
 - `run_solar2d_project` - Run a Solar2D project in the simulator
   - Accepts project directory or main.lua path
   - Optional debug and console flags
-  - Launches simulator in background
+  - Launches simulator in background and returns after fresh instrumentation is ready
+  - Fails within 20 seconds if the child exits or current-launch readiness is not published
   - Injects logger that captures all print() output
 - `read_solar2d_logs` - Read console logs from running Solar2D Simulator
   - View all Lua print() statements from your game code
@@ -259,9 +265,13 @@ The MCP server can capture screenshots from the running simulator for visual ana
 
 ### Screenshot Location
 
-Screenshots are saved to: `/tmp/solar2d_screenshots_<project-name>/`
+Screenshots are saved to: `/tmp/solar2d_screenshots_<project-name>_<launch-id>/`
 
-The directory is cleared when the simulator starts, but screenshots persist across recording sessions within the same run.
+Each launch gets a separate directory; screenshots persist across recording sessions within that run.
+
+Simulator screenshot references used by `preview_social_post` (`latest`,
+`last`, or a number) resolve only inside the currently tracked launch's
+directory. An inactive project returns an error instead of using older files.
 
 ### Recording Workflow
 

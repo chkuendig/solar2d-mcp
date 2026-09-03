@@ -5,14 +5,14 @@ Social media preview — resolve media, optimize images, generate HTML preview, 
 import base64
 import json
 import os
+import re
 import tempfile
 import webbrowser
 from io import BytesIO
-from pathlib import Path
 
 from mcp.types import TextContent, Tool
 
-from utils import find_main_lua
+from utils import get_current_launch
 
 TOOL = Tool(
     name="preview_social_post",
@@ -80,49 +80,55 @@ PLATFORM_CHAR_LIMITS = {
 }
 
 DRAFT_FILE = os.path.join(tempfile.gettempdir(), "solar2d_social_draft.json")
+RECORDED_SCREENSHOT = re.compile(r"^screenshot_(\d+)\.jpg$")
 
 
-def _resolve_media_path(media: str, project_path: str | None) -> str | None:
-    """Resolve media reference to a file path, using same conventions as screenshot.py."""
+def _resolve_media_path(media: str, project_path: str | None) -> tuple[str | None, str | None]:
+    """Resolve media without crossing the currently owned simulator launch."""
     if not media:
-        return None
+        return None, None
 
     # Direct file path
     if os.path.isfile(media):
-        return media
+        return media, None
 
-    # Needs project_path for screenshot references
+    # Simulator screenshot references require the live launch record.
     if not project_path:
-        return None
+        return None, "project_path is required for simulator screenshot references."
 
-    try:
-        main_lua_path = find_main_lua(project_path)
-        project_name = Path(main_lua_path).parent.name
-    except Exception:
-        return None
-
-    screenshot_dir = os.path.join(tempfile.gettempdir(), f"solar2d_screenshots_{project_name}")
+    launch, error = get_current_launch(project_path)
+    if error:
+        return None, error
+    assert launch is not None
+    screenshot_dir = launch.get("screenshot_dir")
+    if not screenshot_dir:
+        return None, "The current Solar2D launch has no screenshot directory. Run the project again."
     if not os.path.isdir(screenshot_dir):
-        return None
+        return None, "No screenshots exist for the current Solar2D launch. Record screenshots first."
 
     if media == "latest":
         path = os.path.join(screenshot_dir, "screenshot_latest.jpg")
-        return path if os.path.isfile(path) else None
+        if os.path.isfile(path):
+            return path, None
+        return None, "No latest screenshot exists for the current Solar2D launch."
     elif media == "last":
-        screenshots = sorted([
-            f for f in os.listdir(screenshot_dir)
-            if f.startswith("screenshot_") and f.endswith(".jpg") and f != "screenshot_latest.jpg"
-        ])
+        screenshots = [
+            (int(match.group(1)), filename)
+            for filename in os.listdir(screenshot_dir)
+            if (match := RECORDED_SCREENSHOT.match(filename))
+        ]
         if screenshots:
-            return os.path.join(screenshot_dir, screenshots[-1])
-        return None
+            return os.path.join(screenshot_dir, max(screenshots)[1]), None
+        return None, "No recorded screenshots exist for the current Solar2D launch."
     else:
         try:
             num = int(media)
             path = os.path.join(screenshot_dir, f"screenshot_{num:03d}.jpg")
-            return path if os.path.isfile(path) else None
+            if os.path.isfile(path):
+                return path, None
+            return None, f"Screenshot {num} does not exist for the current Solar2D launch."
         except ValueError:
-            return None
+            return None, f"Invalid simulator screenshot reference: {media}."
 
 
 def _optimize_image_for_platform(image_path: str, platform: str) -> str:
@@ -304,11 +310,11 @@ async def handle(arguments: dict) -> list[TextContent]:
     # Resolve media
     media_path = None
     if media:
-        media_path = _resolve_media_path(media, project_path)
+        media_path, media_error = _resolve_media_path(media, project_path)
         if media_path is None:
             return [TextContent(
                 type="text",
-                text=f"Error: Could not resolve media '{media}'. "
+                text=f"Error: Could not resolve media '{media}': {media_error} "
                      f"Use 'latest', 'last', a number, or a direct file path. "
                      f"If using screenshot references, provide project_path."
             )]
