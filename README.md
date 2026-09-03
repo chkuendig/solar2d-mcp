@@ -62,6 +62,22 @@ claude mcp list
 
 You can also add it to a specific project using `--scope project` or create a `.mcp.json` file in your project root.
 
+### Shared runtimes
+
+Multiple MCP clients may connect to the same long-lived runtime, but Solar2D
+simulator access is intentionally limited to one client at a time. The slot is
+claimed lazily on the first simulator-dependent tool call. Other clients stay
+connected and receive a `Solar2D runtime is busy` response until the owner
+disconnects. On disconnect, the server stops only simulator processes it
+started and releases the slot; it never uses a container-wide `pkill`.
+
+Set `SOLAR2D_MCP_RUNTIME_DIR` when several server processes need to coordinate
+through a specific shared directory. They must see the same filesystem path.
+
+Set `SOLAR2D_MCP_ARTIFACT_DIR` to a host-mounted directory when encoded
+recordings must survive the runtime container or be uploaded by the client.
+
+
 ## First-Time Setup
 
 On first use, the server needs to know where your Solar2D Simulator is installed.

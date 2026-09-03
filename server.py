@@ -5,12 +5,14 @@ A Model Context Protocol server for working with Solar2D (Corona SDK) projects.
 """
 
 import asyncio
+import signal
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Resource, Tool
 
 from resources import RESOURCES, read_resource
+from runtime import shutdown_runtime
 from tools import TOOLS, call_tool
 
 # Initialize the MCP server
@@ -42,14 +44,27 @@ async def handle_read_resource(uri: str) -> str:
 
 
 async def main():
-    """Run the MCP server."""
-    async with stdio_server() as (read_stream, write_stream):
-        await app.run(
-            read_stream,
-            write_stream,
-            app.create_initialization_options()
-        )
+    """Run the MCP server and clean up its owned simulator on disconnect."""
+    # Tool dispatch claims the slot lazily, so initialization is always
+    # healthy even while another MCP session has the simulator.
+    try:
+        async with stdio_server() as (read_stream, write_stream):
+            await app.run(
+                read_stream,
+                write_stream,
+                app.create_initialization_options()
+            )
+    finally:
+        shutdown_runtime()
+
+
+def _handle_shutdown_signal(signum, _frame) -> None:
+    """Clean up the owned simulator before a session timeout terminates us."""
+    shutdown_runtime()
+    raise SystemExit(128 + signum)
 
 
 if __name__ == "__main__":
+    for shutdown_signal in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(shutdown_signal, _handle_shutdown_signal)
     asyncio.run(main())

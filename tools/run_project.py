@@ -4,7 +4,6 @@ run_solar2d_project tool - Run a Solar2D project in the simulator.
 
 import os
 import platform
-import signal
 import subprocess
 import tempfile
 from pathlib import Path
@@ -12,6 +11,7 @@ from pathlib import Path
 from mcp.types import TextContent, Tool
 
 import config
+from runtime import stop_tracked_simulators
 from utils import find_main_lua, running_projects
 
 TOOL = Tool(
@@ -914,29 +914,9 @@ async def handle(arguments: dict) -> list[TextContent]:
     main_lua_path = find_main_lua(project_path)
     project_dir = str(Path(main_lua_path).parent)
 
-    # Kill any running simulators — only one can run at a time
-    # First, clean up any we're tracking
-    for old_dir in list(running_projects.keys()):
-        old_process = running_projects[old_dir]["process"]
-        if old_process.poll() is None:
-            old_process.terminate()
-            try:
-                old_process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                old_process.kill()
-        del running_projects[old_dir]
-
-    # Also kill any simulator processes we're NOT tracking (e.g. launched externally or before server restart)
-    try:
-        result = subprocess.run(["pgrep", "-f", "Corona Simulator"], capture_output=True, text=True)
-        for pid_str in result.stdout.strip().splitlines():
-            try:
-                pid = int(pid_str)
-                os.kill(pid, signal.SIGTERM)
-            except (ValueError, ProcessLookupError, PermissionError):
-                pass
-    except FileNotFoundError:
-        pass
+    # One server owns one simulator slot. Never kill an untracked process: it
+    # can belong to another MCP client in the retained runtime.
+    stop_tracked_simulators()
 
     # Check if main.lua exists
     if not os.path.exists(main_lua_path):

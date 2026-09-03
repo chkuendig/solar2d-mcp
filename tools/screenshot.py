@@ -121,7 +121,7 @@ ENCODE_VIDEO_TOOL = Tool(
             },
             "filename": {
                 "type": "string",
-                "description": "Output file name (\".mp4\" appended if missing). Written to a 'video/' subdir of the screenshot dir. (default: recording.mp4)",
+                "description": "Output file name (\".mp4\" appended if missing). Written to SOLAR2D_MCP_ARTIFACT_DIR when configured, otherwise the screenshot video directory.",
                 "default": "recording.mp4"
             }
         },
@@ -147,6 +147,14 @@ def _get_project_name(project_path: str) -> str:
 def _get_screenshot_dir(project_name: str) -> str:
     """Get the screenshot directory path."""
     return os.path.join(tempfile.gettempdir(), f"solar2d_screenshots_{project_name}")
+
+
+def _get_video_dir(screenshot_dir: str) -> str:
+    """Return a host-exportable video directory when one is configured."""
+    artifact_dir = os.environ.get("SOLAR2D_MCP_ARTIFACT_DIR")
+    if artifact_dir:
+        return os.path.abspath(os.path.expanduser(artifact_dir))
+    return os.path.join(screenshot_dir, "video")
 
 
 def _get_control_file(project_name: str) -> str:
@@ -359,7 +367,7 @@ async def handle_encode_video(arguments: dict) -> list[TextContent]:
 
     fps = max(1, int(arguments.get("fps", 10)))
     width = int(arguments.get("width", 560))
-    filename = str(arguments.get("filename", "recording.mp4"))
+    filename = Path(str(arguments.get("filename", "recording.mp4"))).name
     if not filename.lower().endswith(".mp4"):
         filename += ".mp4"
 
@@ -406,7 +414,7 @@ async def handle_encode_video(arguments: dict) -> list[TextContent]:
                  "Install it: brew install ffmpeg (macOS), apt-get install ffmpeg (Debian/Ubuntu)."
         )]
 
-    video_dir = os.path.join(screenshot_dir, "video")
+    video_dir = _get_video_dir(screenshot_dir)
     os.makedirs(video_dir, exist_ok=True)
     out_path = os.path.join(video_dir, filename)
 
