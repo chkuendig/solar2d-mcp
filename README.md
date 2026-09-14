@@ -76,6 +76,10 @@ If another run request overlaps setup or readiness, it receives a prompt
 `launch is already in progress` error while the MCP connection stays healthy.
 Only the winning launch can own the tracked simulator.
 
+`run_solar2d_project(reload=true)` reuses the same tracked simulator and the
+same launch lock/readiness serialization as a fresh spawn; it does not
+acquire a second lease or change busy-owner semantics.
+
 Set `SOLAR2D_MCP_RUNTIME_DIR` when several server processes need to coordinate
 through a specific shared directory. They must see the same filesystem path.
 
@@ -119,6 +123,13 @@ Assistant: [calls configure_solar2d(confirm=true)]
   - Launches simulator in background and returns after fresh instrumentation is ready
   - Fails within 20 seconds if the child exits or current-launch readiness is not published
   - Injects logger that captures all print() output
+  - `reload=true` reloads an already-running simulator in place instead of
+    stopping and respawning it (Linux only). Falls back to a fresh spawn
+    automatically if no simulator is tracked for the project, it has
+    exited, or the reload does not become ready in time. The response
+    reports which path was taken (`Launch path: reload` or `fresh spawn`)
+    and the measured latency, so an edit-reload-screenshot loop can skip
+    the full boot/login/navigation cost of a restart on every iteration
 - `read_solar2d_logs` - Read console logs from running Solar2D Simulator
   - View all Lua print() statements from your game code
   - Configurable number of recent lines to display

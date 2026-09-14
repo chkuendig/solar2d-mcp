@@ -19,7 +19,7 @@ from mcp.types import TextContent, Tool
 import config
 from runtime import _stop_process as stop_process
 from runtime import stop_tracked_simulators
-from utils import find_main_lua, running_projects
+from utils import find_main_lua, get_current_launch, running_projects
 
 LAUNCH_TIMEOUT_SECONDS = 20.0
 READINESS_POLL_SECONDS = 0.05
@@ -45,6 +45,17 @@ TOOL = Tool(
             "no_console": {
                 "type": "boolean",
                 "description": "Disable console output (default: false to capture logs)",
+                "default": False
+            },
+            "reload": {
+                "type": "boolean",
+                "description": (
+                    "Reload the already-running simulator in place instead of "
+                    "restarting it (default: false). Falls back to a fresh "
+                    "spawn automatically if no simulator is tracked for this "
+                    "project, it has exited, or the reload does not become "
+                    "ready in time."
+                ),
                 "default": False
             }
         },
@@ -918,6 +929,54 @@ def inject_logger_into_main_lua(main_lua_path: str) -> bool:
         return False
 
 
+def _sandbox_app_conf_path(project_dir: str) -> Path:
+    """Path to the Linux simulator's per-project sandbox config.
+
+    The simulator derives its sandbox name from the basename of the project
+    directory it was launched with (Rtt_LinuxContext.cpp SolarAppContext::LoadApp),
+    and stores it at ~/.Solar2D/Sandbox/<name>/app.conf.
+    """
+    app_name = Path(project_dir).name
+    return Path.home() / ".Solar2D" / "Sandbox" / app_name / "app.conf"
+
+
+def _ensure_relaunch_on_file_change(project_dir: str) -> None:
+    """Make the Linux simulator reload this project in place on file changes.
+
+    app.conf is a plain `key=value` file, not JSON, and the simulator merges
+    it into its in-memory config rather than replacing it wholesale, so
+    writing just this one key is safe even though the simulator later
+    rewrites the full file itself.
+    """
+    if platform.system() != "Linux":
+        return
+
+    conf_path = _sandbox_app_conf_path(project_dir)
+    pairs: dict[str, str] = {}
+    try:
+        for line in conf_path.read_text().splitlines():
+            key, sep, value = line.partition("=")
+            if sep:
+                pairs[key] = value
+    except OSError:
+        pass
+
+    if pairs.get("relaunchOnFileChange") == "Always":
+        return
+
+    pairs["relaunchOnFileChange"] = "Always"
+    conf_path.parent.mkdir(parents=True, exist_ok=True)
+    conf_path.write_text("".join(f"{key}={value}\n" for key, value in pairs.items()))
+
+
+def _touch_main_lua(main_lua_path: str) -> None:
+    """Rewrite main.lua's bytes unchanged so the simulator's file watcher
+    (inotify, non-recursive on the project root) sees a modify event on the
+    already-running project and relaunches it in place."""
+    path = Path(main_lua_path)
+    path.write_bytes(path.read_bytes())
+
+
 class _LaunchCancelled(Exception):
     """Preparation was abandoned before its process could be handed off."""
 
@@ -1074,6 +1133,7 @@ def _prepare_and_spawn(
         **_launch_paths(project_name, launch_id),
     }
     _remove_launch_ipc(launch)
+    _ensure_relaunch_on_file_change(project_dir)
 
     for path in _helper_paths(project_dir).values():
         launch["helper_backups"][path] = _snapshot_owned_file(path)
@@ -1157,6 +1217,21 @@ async def _wait_for_launch(launch: dict, deadline: float) -> tuple[str, int | No
         await asyncio.sleep(min(READINESS_POLL_SECONDS, remaining))
 
 
+async def _attempt_reload(launch: dict, main_lua_path: str, deadline: float) -> tuple[str, int | None, float]:
+    """Ask the already-running simulator to relaunch this project in place.
+
+    Reuses `_wait_for_launch`'s readiness polling: the reload re-executes the
+    same on-disk main.lua (already instrumented), so the touch module
+    republishes the same launch_id with a fresh mtime once it comes back up.
+    """
+    reload_start = asyncio.get_running_loop().time()
+    launch["started_at_ns"] = time.time_ns()
+    await asyncio.to_thread(_touch_main_lua, main_lua_path)
+    readiness, return_code = await _wait_for_launch(launch, deadline)
+    elapsed = asyncio.get_running_loop().time() - reload_start
+    return readiness, return_code, elapsed
+
+
 async def _cleanup_launch(launch: dict) -> None:
     current = running_projects.get(launch["project_dir"])
     if current is launch or (
@@ -1199,6 +1274,7 @@ async def _handle_owned_launch(
     project_path = arguments.get("project_path")
     debug = arguments.get("debug", True)
     no_console = arguments.get("no_console", False)
+    reload_requested = arguments.get("reload", False)
 
     if not project_path:
         return [TextContent(type="text", text="Error: project_path is required")]
@@ -1241,6 +1317,40 @@ async def _handle_owned_launch(
             text=f"Error: main.lua not found at {main_lua_path}"
         )]
 
+    reload_note = ""
+    if reload_requested:
+        tracked_launch, unavailable_reason = get_current_launch(project_path)
+        if tracked_launch is not None:
+            reload_deadline = asyncio.get_running_loop().time() + LAUNCH_TIMEOUT_SECONDS
+            readiness, return_code, elapsed = await _attempt_reload(
+                tracked_launch, main_lua_path, reload_deadline
+            )
+            if readiness == "ready":
+                return [TextContent(
+                    type="text",
+                    text=(
+                        "Solar2D Simulator reloaded in place!\n\n"
+                        f"Launch path: reload\n"
+                        f"Reload latency: {elapsed:.2f}s\n"
+                        f"Project: {main_lua_path}\n"
+                        f"PID: {tracked_launch['pid']}\n"
+                        f"Launch ID: {tracked_launch['launch_id']}\n"
+                        f"Log file: {tracked_launch['log_file']}\n"
+                        f"Screenshot dir: {tracked_launch['screenshot_dir']}\n\n"
+                        "Use read_solar2d_logs to view the console output.\n"
+                        "Use start_screenshot_recording to capture screenshots."
+                    ),
+                )]
+            detail = (
+                f"exited with code {return_code}"
+                if readiness == "exited"
+                else f"did not become ready within {LAUNCH_TIMEOUT_SECONDS:g}s"
+            )
+            await _cleanup_launch(tracked_launch)
+            reload_note = f"Reload requested but fell back to a fresh spawn: {detail}.\n\n"
+        else:
+            reload_note = f"Reload requested but fell back to a fresh spawn: {unavailable_reason}\n\n"
+
     project_name = Path(project_dir).name
     log_file = os.path.join(tempfile.gettempdir(), f"corona_log_{project_name}.txt")
     launch_id = uuid.uuid4().hex
@@ -1256,7 +1366,8 @@ async def _handle_owned_launch(
         cmd.append(main_lua_path)
 
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + LAUNCH_TIMEOUT_SECONDS
+    spawn_start = loop.time()
+    deadline = spawn_start + LAUNCH_TIMEOUT_SECONDS
     cancelled = threading.Event()
     preparation = asyncio.create_task(asyncio.to_thread(
         _prepare_and_spawn,
@@ -1332,10 +1443,14 @@ async def _handle_owned_launch(
         "Touch module injected into main.lua" if launch["touch_injected"] else "Touch module already present in main.lua",
     ]
 
+    spawn_elapsed = asyncio.get_running_loop().time() - spawn_start
     return [TextContent(
         type="text",
         text=(
+            f"{reload_note}"
             "Solar2D Simulator launched and instrumentation is ready!\n\n"
+            "Launch path: fresh spawn\n"
+            f"Launch latency: {spawn_elapsed:.2f}s\n"
             f"Project: {main_lua_path}\n"
             f"PID: {launch['pid']}\n"
             f"Launch ID: {launch_id}\n"
