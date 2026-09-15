@@ -80,6 +80,11 @@ Only the winning launch can own the tracked simulator.
 same launch lock/readiness serialization as a fresh spawn; it does not
 acquire a second lease or change busy-owner semantics.
 
+When the owning MCP client disconnects or its session times out, the simulator
+is stopped before launch-specific IPC files are removed. Helper modules and
+`main.lua` requires created by that launch are also removed or restored when
+their contents are still unchanged; later user edits are left intact.
+
 Set `SOLAR2D_MCP_RUNTIME_DIR` when several server processes need to coordinate
 through a specific shared directory. They must see the same filesystem path.
 

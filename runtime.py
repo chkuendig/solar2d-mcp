@@ -183,7 +183,7 @@ def _finish_recording_process(process: Any, timeout: float = 8.0) -> None:
 
 
 def stop_tracked_simulators() -> None:
-    """Stop only simulator processes this MCP server launched and recorded."""
+    """Stop tracked processes and run their launch-scoped file cleanup."""
     for project in list(running_projects.values()):
         recording = project.pop("video_recording", None)
         if recording is not None:
@@ -195,6 +195,14 @@ def stop_tracked_simulators() -> None:
         process = project.get("process")
         if process is not None:
             _stop_process(process)
+        cleanup_files = project.get("cleanup_files")
+        if callable(cleanup_files):
+            try:
+                cleanup_files(project)
+            except Exception:
+                # Shutdown must still clear ownership and release the shared
+                # simulator lease when a project path has become inaccessible.
+                pass
     running_projects.clear()
 
 

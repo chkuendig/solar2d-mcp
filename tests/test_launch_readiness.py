@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import runtime
 from tools import run_project, touch
 from utils import running_projects
 
@@ -361,6 +362,35 @@ class LaunchReadinessTests(unittest.TestCase):
 
         self.assertEqual(restored.read_bytes(), original)
         self.assertEqual(created.read_bytes(), b"user-edited generated screenshot")
+
+    def test_runtime_shutdown_restores_launch_owned_source_files(self) -> None:
+        project = make_project(self.tmp_path)
+        main_lua = project / "main.lua"
+        original = main_lua.read_bytes()
+        logger = project / "_mcp_logger.lua"
+        generated_logger = b"generated logger\n"
+        logger.write_bytes(generated_logger)
+        self.assertTrue(run_project.inject_module_into_main_lua(str(main_lua), "_mcp_logger"))
+
+        info_file = self.tmp_path / "display.json"
+        launch = track_launch(project, info_file)
+        launch.update({
+            "logger_injected": True,
+            "helper_backups": {str(logger): None},
+            "generated_helpers": {str(logger): generated_logger},
+            "cleanup_files": run_project._cleanup_launch_files,
+        })
+        for key in ("display_info_file", "screenshot_control_file", "touch_control_file"):
+            Path(launch[key]).write_text("launch-owned")
+
+        with mock.patch.object(runtime, "_stop_process"):
+            runtime.stop_tracked_simulators()
+
+        self.assertEqual(main_lua.read_bytes(), original)
+        self.assertFalse(logger.exists())
+        for key in ("display_info_file", "screenshot_control_file", "touch_control_file"):
+            self.assertFalse(Path(launch[key]).exists())
+        self.assertFalse(running_projects)
 
     def test_partial_helper_failure_rolls_back_created_files(self) -> None:
         project = make_project(self.tmp_path)

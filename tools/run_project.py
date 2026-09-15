@@ -1087,16 +1087,21 @@ def _restore_launch_artifacts(launch: dict) -> None:
         _restore_owned_file(path, original, generated_helpers.get(path))
 
 
+def _cleanup_launch_files(launch: dict) -> None:
+    """Restore source artifacts and remove launch-specific IPC files."""
+    try:
+        _restore_launch_artifacts(launch)
+    finally:
+        _remove_launch_ipc(launch)
+
+
 def _stop_launch(launch: dict) -> None:
     try:
         process = launch.get("process")
         if process is not None:
             stop_process(process)
     finally:
-        try:
-            _restore_launch_artifacts(launch)
-        finally:
-            _remove_launch_ipc(launch)
+        _cleanup_launch_files(launch)
 
 
 def _prepare_and_spawn(
@@ -1128,6 +1133,7 @@ def _prepare_and_spawn(
         "log_file": log_file,
         "helper_backups": {},
         "generated_helpers": {},
+        "cleanup_files": _cleanup_launch_files,
         **_launch_paths(project_name, launch_id),
     }
     _remove_launch_ipc(launch)

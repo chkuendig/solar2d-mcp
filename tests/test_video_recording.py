@@ -236,6 +236,8 @@ class VideoRecordingTests(unittest.TestCase):
             "log_handle": log_handle,
             "log_path": str(log_path),
         }
+        cleanup_files = mock.Mock()
+        self.launch["cleanup_files"] = cleanup_files
 
         with (
             mock.patch.object(runtime, "_finish_recording_process") as finish_recording,
@@ -245,8 +247,19 @@ class VideoRecordingTests(unittest.TestCase):
 
         finish_recording.assert_called_once_with(recorder)
         stop_process.assert_called_once_with(simulator)
+        cleanup_files.assert_called_once_with(self.launch)
         self.assertTrue(log_handle.closed)
         self.assertFalse(log_path.exists())
+        self.assertFalse(running_projects)
+
+    def test_runtime_shutdown_continues_when_file_cleanup_fails(self) -> None:
+        self.launch["cleanup_files"] = mock.Mock(side_effect=OSError("project disappeared"))
+
+        with mock.patch.object(runtime, "_stop_process") as stop_process:
+            runtime.stop_tracked_simulators()
+
+        stop_process.assert_called_once_with(self.launch["process"])
+        self.launch["cleanup_files"].assert_called_once_with(self.launch)
         self.assertFalse(running_projects)
 
     def test_recording_process_is_finalized_with_ffmpeg_quit_command(self) -> None:
