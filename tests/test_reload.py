@@ -171,36 +171,76 @@ class ReloadPathSelectionTests(unittest.TestCase):
         self.assertIn("Launch path: fresh spawn", text)
         self.assertIs(running_projects[str(project)]["process"], new_process)
 
-    def test_reload_falls_back_to_fresh_spawn_on_readiness_timeout(self) -> None:
+    def test_reload_timeout_leaves_tracked_simulator_running(self) -> None:
         project = make_project(self.tmp_path)
         simulator = self.tmp_path / "simulator"
         simulator.write_text("")
         old_process = FakeProcess(11111)
         track_launch(project, launch_id="stale-launch", process=old_process)
-        new_process = FakeProcess(22222)
-
-        stopped: list[FakeProcess] = []
-
-        def stop(fake: FakeProcess) -> None:
-            stopped.append(fake)
-            fake.running = False
-
         with (
             mock.patch.object(
                 run_project.config, "get_simulator_or_detect", return_value=(str(simulator), [], False)
             ),
             mock.patch.object(run_project, "LAUNCH_TIMEOUT_SECONDS", 0.03),
             mock.patch.object(run_project, "READINESS_POLL_SECONDS", 0.005),
-            mock.patch.object(run_project, "stop_process", side_effect=stop),
+            mock.patch.object(run_project, "_prepare_and_spawn") as prepare,
+        ):
+            result = asyncio.run(run_project.handle({"project_path": str(project), "reload": True}))
+
+        text = result[0].text
+        self.assertIn("reload did not publish fresh instrumentation within 0.03s", text)
+        self.assertIn("Launch path: reload", text)
+        self.assertIn(f"PID: {old_process.pid} (left running)", text)
+        prepare.assert_not_called()
+        self.assertIsNone(old_process.poll())
+        self.assertIs(running_projects[str(project)]["process"], old_process)
+
+    def test_reload_falls_back_when_process_exits_during_reload(self) -> None:
+        project = make_project(self.tmp_path)
+        simulator = self.tmp_path / "simulator"
+        simulator.write_text("")
+        old_process = FakeProcess(11111)
+        launch = track_launch(project, launch_id="old-launch", process=old_process)
+        new_process = FakeProcess(22222)
+
+        def fake_touch(main_lua_path: str) -> None:
+            old_process.running = False
+
+        with (
+            mock.patch.object(
+                run_project.config, "get_simulator_or_detect", return_value=(str(simulator), [], False)
+            ),
+            mock.patch.object(run_project, "_touch_main_lua", side_effect=fake_touch),
             mock.patch.object(run_project, "_prepare_and_spawn", side_effect=fake_prepare(project, new_process)),
         ):
             result = asyncio.run(run_project.handle({"project_path": str(project), "reload": True}))
 
         text = result[0].text
-        self.assertIn("Reload requested but fell back to a fresh spawn: did not become ready within 0.03s", text)
+        self.assertIn("the tracked simulator exited with code 0", text)
         self.assertIn("Launch path: fresh spawn", text)
-        self.assertEqual(stopped, [old_process])
+        self.assertIsNot(running_projects[str(project)], launch)
         self.assertIs(running_projects[str(project)]["process"], new_process)
+
+    def test_reload_trigger_error_leaves_tracked_simulator_running(self) -> None:
+        project = make_project(self.tmp_path)
+        simulator = self.tmp_path / "simulator"
+        simulator.write_text("")
+        process = FakeProcess()
+        track_launch(project, launch_id="existing-launch", process=process)
+
+        with (
+            mock.patch.object(
+                run_project.config, "get_simulator_or_detect", return_value=(str(simulator), [], False)
+            ),
+            mock.patch.object(run_project, "_touch_main_lua", side_effect=OSError("read-only filesystem")),
+            mock.patch.object(run_project, "_prepare_and_spawn") as prepare,
+        ):
+            result = asyncio.run(run_project.handle({"project_path": str(project), "reload": True}))
+
+        self.assertIn("tracked simulator was left running: read-only filesystem", result[0].text)
+        prepare.assert_not_called()
+        self.assertIsNone(process.poll())
+        self.assertIs(running_projects[str(project)]["process"], process)
 
     def test_reload_not_attempted_when_flag_is_omitted(self) -> None:
         project = make_project(self.tmp_path)
@@ -226,7 +266,7 @@ class ReloadPathSelectionTests(unittest.TestCase):
         self.assertIs(running_projects[str(project)]["process"], new_process)
 
 
-class SandboxConfigTests(unittest.TestCase):
+class SimulatorConfigTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.tmp_path = Path(self.temp_dir.name)
@@ -235,48 +275,42 @@ class SandboxConfigTests(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_ensure_relaunch_on_file_change_writes_key_value_pair(self) -> None:
-        project_dir = self.tmp_path / "myproject"
-        project_dir.mkdir()
         fake_home = self.tmp_path / "home"
 
         with (
             mock.patch.object(run_project.platform, "system", return_value="Linux"),
             mock.patch.object(run_project.Path, "home", return_value=fake_home),
         ):
-            run_project._ensure_relaunch_on_file_change(str(project_dir))
+            run_project._ensure_relaunch_on_file_change()
 
-        conf_path = fake_home / ".Solar2D" / "Sandbox" / "myproject" / "app.conf"
+        conf_path = fake_home / ".Solar2D" / "Sandbox" / "homescreen" / "app.conf"
         self.assertEqual(conf_path.read_text(), "relaunchOnFileChange=Always\n")
 
     def test_ensure_relaunch_on_file_change_is_idempotent_and_preserves_other_keys(self) -> None:
-        project_dir = self.tmp_path / "myproject"
-        project_dir.mkdir()
         fake_home = self.tmp_path / "home"
 
         with (
             mock.patch.object(run_project.platform, "system", return_value="Linux"),
             mock.patch.object(run_project.Path, "home", return_value=fake_home),
         ):
-            run_project._ensure_relaunch_on_file_change(str(project_dir))
-            conf_path = fake_home / ".Solar2D" / "Sandbox" / "myproject" / "app.conf"
+            run_project._ensure_relaunch_on_file_change()
+            conf_path = fake_home / ".Solar2D" / "Sandbox" / "homescreen" / "app.conf"
             conf_path.write_text(conf_path.read_text() + "showWelcome=false\n")
 
-            run_project._ensure_relaunch_on_file_change(str(project_dir))
+            run_project._ensure_relaunch_on_file_change()
 
         content = conf_path.read_text()
         self.assertEqual(content.count("relaunchOnFileChange=Always"), 1)
         self.assertIn("showWelcome=false", content)
 
     def test_ensure_relaunch_on_file_change_is_a_noop_off_linux(self) -> None:
-        project_dir = self.tmp_path / "myproject"
-        project_dir.mkdir()
         fake_home = self.tmp_path / "home"
 
         with (
             mock.patch.object(run_project.platform, "system", return_value="Darwin"),
             mock.patch.object(run_project.Path, "home", return_value=fake_home),
         ):
-            run_project._ensure_relaunch_on_file_change(str(project_dir))
+            run_project._ensure_relaunch_on_file_change()
 
         self.assertFalse((fake_home / ".Solar2D").exists())
 

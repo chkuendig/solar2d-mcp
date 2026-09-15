@@ -52,9 +52,8 @@ TOOL = Tool(
                 "description": (
                     "Reload the already-running simulator in place instead of "
                     "restarting it (default: false). Falls back to a fresh "
-                    "spawn automatically if no simulator is tracked for this "
-                    "project, it has exited, or the reload does not become "
-                    "ready in time."
+                    "spawn automatically if no live simulator is tracked for "
+                    "this project."
                 ),
                 "default": False
             }
@@ -929,19 +928,18 @@ def inject_logger_into_main_lua(main_lua_path: str) -> bool:
         return False
 
 
-def _sandbox_app_conf_path(project_dir: str) -> Path:
-    """Path to the Linux simulator's per-project sandbox config.
+def _simulator_app_conf_path() -> Path:
+    """Path to the Linux simulator's global preferences.
 
-    The simulator derives its sandbox name from the basename of the project
-    directory it was launched with (Rtt_LinuxContext.cpp SolarAppContext::LoadApp),
-    and stores it at ~/.Solar2D/Sandbox/<name>/app.conf.
+    ``SolarSimulator::Init`` loads these settings from the ``homescreen``
+    sandbox. Project sandboxes have a separate ``SolarAppContext`` config and
+    do not control the simulator's file-watcher policy.
     """
-    app_name = Path(project_dir).name
-    return Path.home() / ".Solar2D" / "Sandbox" / app_name / "app.conf"
+    return Path.home() / ".Solar2D" / "Sandbox" / "homescreen" / "app.conf"
 
 
-def _ensure_relaunch_on_file_change(project_dir: str) -> None:
-    """Make the Linux simulator reload this project in place on file changes.
+def _ensure_relaunch_on_file_change() -> None:
+    """Make the Linux simulator reload its open project on Lua file changes.
 
     app.conf is a plain `key=value` file, not JSON, and the simulator merges
     it into its in-memory config rather than replacing it wholesale, so
@@ -951,7 +949,7 @@ def _ensure_relaunch_on_file_change(project_dir: str) -> None:
     if platform.system() != "Linux":
         return
 
-    conf_path = _sandbox_app_conf_path(project_dir)
+    conf_path = _simulator_app_conf_path()
     pairs: dict[str, str] = {}
     try:
         for line in conf_path.read_text().splitlines():
@@ -1133,7 +1131,7 @@ def _prepare_and_spawn(
         **_launch_paths(project_name, launch_id),
     }
     _remove_launch_ipc(launch)
-    _ensure_relaunch_on_file_change(project_dir)
+    _ensure_relaunch_on_file_change()
 
     for path in _helper_paths(project_dir).values():
         launch["helper_backups"][path] = _snapshot_owned_file(path)
@@ -1322,9 +1320,18 @@ async def _handle_owned_launch(
         tracked_launch, unavailable_reason = get_current_launch(project_path)
         if tracked_launch is not None:
             reload_deadline = asyncio.get_running_loop().time() + LAUNCH_TIMEOUT_SECONDS
-            readiness, return_code, elapsed = await _attempt_reload(
-                tracked_launch, main_lua_path, reload_deadline
-            )
+            try:
+                readiness, return_code, elapsed = await _attempt_reload(
+                    tracked_launch, main_lua_path, reload_deadline
+                )
+            except OSError as error:
+                return [TextContent(
+                    type="text",
+                    text=(
+                        "Error: Could not trigger an in-place Solar2D reload; "
+                        f"the tracked simulator was left running: {error}"
+                    ),
+                )]
             if readiness == "ready":
                 return [TextContent(
                     type="text",
@@ -1341,13 +1348,24 @@ async def _handle_owned_launch(
                         "Use start_screenshot_recording to capture screenshots."
                     ),
                 )]
-            detail = (
-                f"exited with code {return_code}"
-                if readiness == "exited"
-                else f"did not become ready within {LAUNCH_TIMEOUT_SECONDS:g}s"
-            )
+            if readiness == "timeout":
+                return [TextContent(
+                    type="text",
+                    text=(
+                        "Error: Solar2D reload did not publish fresh instrumentation "
+                        f"within {LAUNCH_TIMEOUT_SECONDS:g}s.\n\n"
+                        "Launch path: reload\n"
+                        f"Reload latency: {elapsed:.2f}s\n"
+                        f"PID: {tracked_launch['pid']} (left running)\n"
+                        f"Launch ID: {tracked_launch['launch_id']}\n"
+                        "Fix the project error and reload again."
+                    ),
+                )]
             await _cleanup_launch(tracked_launch)
-            reload_note = f"Reload requested but fell back to a fresh spawn: {detail}.\n\n"
+            reload_note = (
+                "Reload requested but fell back to a fresh spawn: "
+                f"the tracked simulator exited with code {return_code}.\n\n"
+            )
         else:
             reload_note = f"Reload requested but fell back to a fresh spawn: {unavailable_reason}\n\n"
 

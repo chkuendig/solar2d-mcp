@@ -125,11 +125,14 @@ Assistant: [calls configure_solar2d(confirm=true)]
   - Injects logger that captures all print() output
   - `reload=true` reloads an already-running simulator in place instead of
     stopping and respawning it (Linux only). Falls back to a fresh spawn
-    automatically if no simulator is tracked for the project, it has
-    exited, or the reload does not become ready in time. The response
+    automatically if no live simulator is tracked for the project. A reload
+    timeout leaves the tracked simulator running so the next edit can recover
+    without a full restart. The response
     reports which path was taken (`Launch path: reload` or `fresh spawn`)
     and the measured latency, so an edit-reload-screenshot loop can skip
-    the full boot/login/navigation cost of a restart on every iteration
+    the full boot/login/navigation cost of a restart on every iteration.
+    On Linux, fresh launches ensure the simulator-wide file-change preference
+    is enabled in the `homescreen` sandbox.
 - `read_solar2d_logs` - Read console logs from running Solar2D Simulator
   - View all Lua print() statements from your game code
   - Configurable number of recent lines to display
