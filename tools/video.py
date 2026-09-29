@@ -245,6 +245,16 @@ def _encoder_command(
         # rewrite would never happen.
         "-movflags",
         "+frag_keyframe+empty_moov+default_base_moof",
+        # Close a fragment per second of content (microseconds). A muxer-side
+        # knob rather than -g: it is independent of the requested fps cap and
+        # of the encoder GOP, bounding a killed run's unflushed tail to ~1s.
+        "-frag_duration",
+        "1000000",
+        # avio otherwise buffers closed fragments in userspace, so a kill can
+        # lose far more than the open fragment whenever encoded frames are
+        # small; flush to disk as each fragment closes.
+        "-flush_packets",
+        "1",
         "-t",
         str(duration),
         str(out_path),

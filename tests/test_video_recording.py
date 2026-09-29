@@ -25,10 +25,8 @@ from utils import running_projects
 FRAME_HEADER = struct.Struct("<4sHHIII4sB7xQQ16x")
 
 
-def build_frame(width: int, height: int, seq: int, noisy: bool = False) -> bytes:
-    # Noise gives the encoder a hard content cut, which only matters when
-    # scenecut is active; the test budget also covers the GOP cadence alone.
-    payload = os.urandom(width * height * 4) if noisy else bytes([(0x30 + seq) % 0x100]) * (width * height * 4)
+def build_frame(width: int, height: int, seq: int) -> bytes:
+    payload = bytes([(0x30 + seq) % 0x100]) * (width * height * 4)
     header = FRAME_HEADER.pack(
         b"S2VT", 1, FRAME_HEADER.size, width, height, width * 4, b"BGRA", 1, seq, time.time_ns()
     )
@@ -129,8 +127,8 @@ class FakeTap:
         self.thread.start()
         return self
 
-    def send_frame(self, width: int, height: int, seq: int, noisy: bool = False) -> None:
-        self.commands.put((width, height, seq, noisy))
+    def send_frame(self, width: int, height: int, seq: int) -> None:
+        self.commands.put((width, height, seq))
 
     def finish(self, timeout: float = 5.0) -> None:
         self.commands.put(None)
@@ -152,8 +150,8 @@ class FakeTap:
                 command = self.commands.get()
                 if command is None:
                     break
-                width, height, seq, noisy = command
-                data = build_frame(width, height, seq, noisy)
+                width, height, seq = command
+                data = build_frame(width, height, seq)
                 while data:
                     data = data[os.write(fd, data):]
         except OSError as exc:
@@ -295,6 +293,8 @@ class VideoRecordingTests(unittest.TestCase):
         self.assertEqual(
             command[command.index("-movflags") + 1], "+frag_keyframe+empty_moov+default_base_moof"
         )
+        self.assertEqual(command[command.index("-frag_duration") + 1], "1000000")
+        self.assertEqual(command[command.index("-flush_packets") + 1], "1")
         self.taps[0].finish()
 
     def test_drops_are_counted_from_sequence_gaps(self) -> None:
@@ -482,13 +482,11 @@ class VideoRecordingTests(unittest.TestCase):
             self.taps[0].send_frame(64, 48, seq)
             seq += 1
             time.sleep(0.033)
-        # ultrafast runs with rc-lookahead=0, so scenecut cannot fire and the
-        # first fragment closes at x264's default keyint (250 frames, ~8s at
-        # 30 fps); the noisy cut would only pull it earlier under other
-        # encode settings. The wait budget covers the full GOP.
-        deadline = time.monotonic() + 15.0
+        # -frag_duration closes a moof every second of content, independent of
+        # the fps cap and the encoder GOP, so a fragment must appear quickly.
+        deadline = time.monotonic() + 3.0
         while b"moof" not in _read_bytes(out_path) and time.monotonic() < deadline:
-            self.taps[0].send_frame(64, 48, seq, noisy=True)
+            self.taps[0].send_frame(64, 48, seq)
             seq += 1
             time.sleep(0.033)
         self.assertIn(b"moof", _read_bytes(out_path), "no fragment closed before the kill")
