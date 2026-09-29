@@ -17,8 +17,8 @@ from pathlib import Path
 from mcp.types import TextContent, Tool
 
 import config
+from runtime import _VIDEO_PIPE_PATH, stop_tracked_simulators, take_finished_recording
 from runtime import _stop_process as stop_process
-from runtime import stop_tracked_simulators
 from utils import find_main_lua, get_current_launch, running_projects
 
 LAUNCH_TIMEOUT_SECONDS = 20.0
@@ -1136,6 +1136,11 @@ def _prepare_and_spawn(
         "cleanup_files": _cleanup_launch_files,
         **_launch_paths(project_name, launch_id),
     }
+    finished_recording = take_finished_recording(project_dir)
+    if finished_recording is not None:
+        # The recording the relaunch finalized stays reportable instead of
+        # vanishing with the simulator it was attached to.
+        launch["finished_video_recording"] = finished_recording
     _remove_launch_ipc(launch)
     _ensure_relaunch_on_file_change()
 
@@ -1165,11 +1170,16 @@ def _prepare_and_spawn(
             raise _LaunchCancelled
 
         launch["started_at_ns"] = time.time_ns()
+        # The simulator streams its frames to the runtime dir's video FIFO when
+        # this env var points at it; everything else is inherited unchanged.
+        simulator_env = os.environ.copy()
+        simulator_env["SOLAR2D_VIDEO_PIPE"] = str(_VIDEO_PIPE_PATH)
         process = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            env=simulator_env,
             start_new_session=True,
             close_fds=True,
         )

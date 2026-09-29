@@ -14,7 +14,7 @@ TOOLS: list[Tool] = [
     read_logs.TOOL,
     list_projects.TOOL,
     *screenshot.TOOLS,  # Include all screenshot tools
-    *video.TOOLS,  # Include real-time X11 video tools
+    *video.TOOLS,  # Include real-time video recording tools
     *touch.TOOLS,  # Include touch simulation tools
     *state.TOOLS,  # Include game state and scenario tools
     *solar_scope.TOOLS,  # Include SolarScope test-runner tools

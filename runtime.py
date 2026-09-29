@@ -24,7 +24,20 @@ _RUNTIME_DIR = Path(
 )
 _LOCK_PATH = _RUNTIME_DIR / "simulator.lock"
 _OWNER_PATH = _RUNTIME_DIR / "simulator-owner.json"
+# Where the simulator's frame tap (SOLAR2D_VIDEO_PIPE) streams framed BGRA.
+# The engine creates the FIFO itself; this path is only named here so the
+# launcher and the video relay agree on it.
+_VIDEO_PIPE_PATH = _RUNTIME_DIR / "video.fifo"
 _slot_fd: int | None = None
+
+# Recordings finalized by a relaunch, keyed by project directory, waiting to be
+# attached to the next launch so stop_video_recording can still report them.
+_unreported_recordings: dict[str, dict] = {}
+
+
+def take_finished_recording(project_dir: str) -> dict | None:
+    """Claim the recording a relaunch finalized for this project, if any."""
+    return _unreported_recordings.pop(project_dir, None)
 
 
 def _try_lock(fd: int) -> bool:
@@ -183,15 +196,26 @@ def _finish_recording_process(process: Any, timeout: float = 8.0) -> None:
 
 
 def stop_tracked_simulators() -> None:
-    """Stop tracked processes and run their launch-scoped file cleanup."""
+    """Stop tracked processes and run their launch-scoped file cleanup.
+
+    A recording still active on a tracked launch is finalized here and kept for
+    the next launch of the same project to report, so ending a simulator never
+    silently swallows a finished MP4.
+    """
     for project in list(running_projects.values()):
         recording = project.pop("video_recording", None)
         if recording is not None:
-            _finish_recording_process(recording["process"])
+            finalizer = recording.get("finalize")
+            if callable(finalizer):
+                finalizer(recording)
+            else:
+                _finish_recording_process(recording["process"])
             log_handle = recording.get("log_handle")
             if log_handle is not None and not log_handle.closed:
                 log_handle.close()
-            Path(recording["log_path"]).unlink(missing_ok=True)
+            project_dir = project.get("project_dir")
+            if project_dir is not None:
+                _unreported_recordings[project_dir] = recording
         process = project.get("process")
         if process is not None:
             _stop_process(process)
@@ -209,6 +233,11 @@ def stop_tracked_simulators() -> None:
 def shutdown_runtime() -> None:
     """Cleanly end this server's simulator and release its cross-client lease."""
     stop_tracked_simulators()
+    for recording in _unreported_recordings.values():
+        log_path = recording.get("log_path")
+        if log_path:
+            Path(log_path).unlink(missing_ok=True)
+    _unreported_recordings.clear()
     release_simulator_slot()
 
 

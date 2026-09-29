@@ -152,12 +152,13 @@ Assistant: [calls configure_solar2d(confirm=true)]
   - Default recording duration: 60 seconds (max: 300 seconds / 5 minutes)
   - Can extend recording while already capturing
 - `stop_screenshot_recording` - Stop screenshot recording early
-- `start_video_recording` - Start a real-time X11 framebuffer recording
+- `start_video_recording` - Start a real-time framebuffer recording
   - Captures the simulator display directly at 30 fps by default (15-60 fps)
   - Writes H.264/yuv420p MP4 instead of stitching periodic JPEG screenshots
-  - Linux/X11 only; requires `DISPLAY`, `xdpyinfo`, `ffmpeg`, and `ffprobe`
+  - Requires a runtime whose simulator exposes the offscreen frame tap
+    (`SOLAR2D_VIDEO_PIPE`) plus `ffmpeg` and `ffprobe`; no X11 server is involved
 - `stop_video_recording` - Finalize and verify the real-time MP4
-  - Reports codec, pixel format, even dimensions, frame count, duration, and measured fps
+  - Reports codec, pixel format, even dimensions, frame count, duration, measured fps, and dropped frames
 - `get_simulator_screenshot` - Get screenshot(s) for visual analysis
   - `which="latest"` - Capture fresh screenshot now (default)
   - `which="last"` - Get most recent from recording session
@@ -320,16 +321,26 @@ You can call `start_screenshot_recording` while already recording to extend the 
 
 The screenshot recorder is for visual diagnostics. Its full-stage JPEG writes
 are capped at 10 fps and may run slower under load, so changing the output fps
-does not make its video smoother. On the Linux/X11 runtime, use the framebuffer
-recorder for animation evidence:
+does not make its video smoother. For animation evidence use the framebuffer
+recorder instead:
 
 1. Call `start_video_recording` (30 fps by default).
 2. Drive the simulator while the same MCP session remains connected.
 3. Call `stop_video_recording` to finalize and verify the MP4.
 
-The recorder captures the X11 display directly with ffmpeg, crops odd display
-dimensions to even values when needed, and encodes H.264/yuv420p. The duration
+The recorder does not touch a display server. The launcher points the
+simulator's offscreen frame tap (`SOLAR2D_VIDEO_PIPE`) at a FIFO in the shared
+runtime directory, and a relay thread streams the tap's framed BGRA frames
+into ffmpeg: GL's bottom-up rows are flipped, dimensions are cropped to even
+yuv420p sizes, and H.264 is encoded at a constant frame rate using wall-clock
+timestamps, so dropped frames never compress the timeline. The duration
 argument is a safety ceiling; stopping early is the normal workflow.
+
+The stop report includes the frames the tap produced and how many it dropped
+(sequence gaps). If the window is resized mid-recording, the MP4 is finalized
+at the original size and the stop report says so. A simulator relaunch
+finalizes any active recording; the next `stop_video_recording` on that
+project reports it instead of reporting nothing.
 
 ## Touch Interaction
 
