@@ -146,30 +146,39 @@ def _wait_for_frames(fd: int, stop_event: threading.Event) -> bool:
 
 
 def _read_frame_header(
+    recording: dict[str, Any],
     fd: int,
     stop_event: threading.Event,
-    ready_path: Path,
-    tap_pid: int,
 ) -> tuple[bytes | None, str | None]:
-    """Read one frame header; returns (header, end_reason), not both None."""
+    """Read one frame header; returns (header, end_reason), never both set.
+
+    On a bad magic the stream is misaligned (e.g. a torn frame an earlier
+    reader left in the pipe): slide forward one byte at a time until the next
+    S2VT appears, counting the skipped bytes on the recording.
+    """
+    ready_path = Path(recording["ready_path"])
     buffer = bytearray()
-    while len(buffer) < FRAME_HEADER.size:
-        if stop_event.is_set():
-            return None, "stopped"
-        try:
-            chunk = os.read(fd, FRAME_HEADER.size - len(buffer))
-        except BlockingIOError:
-            if not _wait_for_frames(fd, stop_event):
+    while True:
+        while len(buffer) < FRAME_HEADER.size:
+            if stop_event.is_set():
                 return None, "stopped"
-            continue
-        if chunk:
-            buffer += chunk
-        elif not ready_path.exists() or not Path("/proc", str(tap_pid)).exists():
-            return None, "tap-exited"
-        else:
-            # No writer is connected yet; the tap retries its side ~5x/second.
-            time.sleep(0.05)
-    return bytes(buffer), None
+            try:
+                chunk = os.read(fd, FRAME_HEADER.size - len(buffer))
+            except BlockingIOError:
+                if not _wait_for_frames(fd, stop_event):
+                    return None, "stopped"
+                continue
+            if chunk:
+                buffer += chunk
+            elif not ready_path.exists() or not Path("/proc", str(recording["tap_pid"])).exists():
+                return None, "tap-exited"
+            else:
+                # No writer is connected yet; the tap retries its side ~5x/second.
+                time.sleep(0.05)
+        if buffer[: len(FRAME_MAGIC)] == FRAME_MAGIC:
+            return bytes(buffer), None
+        del buffer[0]
+        recording["resync_bytes"] += 1
 
 
 def _splice_payload(
@@ -187,8 +196,10 @@ def _splice_payload(
         try:
             chunk = os.splice(fd, encoder_stdin, count - moved)
         except BlockingIOError:
-            if not _wait_for_frames(fd, stop_event):
-                return "stopped"
+            # Either end can make splice non-blocking: the FIFO ran dry, or the
+            # encoder's pipe is full because ffmpeg has not drained it yet
+            # (notably its whole startup). Wait for whichever comes first.
+            _, writable, _ = select.select([fd], [encoder_stdin], [], 0.2)
             continue
         except OSError:
             return "encoder-input-closed"
@@ -220,16 +231,18 @@ def _encoder_command(
         f"{width}x{height}",
         "-framerate",
         str(fps),
+        # Wall-clock input timestamps are a demuxer option: it must precede -i,
+        # where after it ffmpeg silently applies it to the output context
+        # instead and dropped or slow frames would compress the timeline. The
+        # relay paces its writes so read time tracks each header's time_ns.
+        "-use_wallclock_as_timestamps",
+        "1",
         "-i",
         "pipe:0",
         "-an",
         # Tap rows are GL bottom-up; vflip, then force even yuv420p dimensions.
         "-vf",
         "vflip,crop=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
-        # Shallow relay buffering keeps read time close to capture time, so
-        # wall-clock timestamps reproduce the real pacing of dropped frames.
-        "-use_wallclock_as_timestamps",
-        "1",
         "-fps_mode",
         "cfr",
         "-r",
@@ -300,7 +313,6 @@ def _close_encoder(encoder: subprocess.Popen[bytes]) -> None:
 def _relay_frames(recording: dict[str, Any]) -> None:
     """Stream framed BGRA frames from the tap FIFO into ffmpeg's stdin."""
     stop_event: threading.Event = recording["stop_event"]
-    ready_path = Path(recording["ready_path"])
     try:
         fd = os.open(recording["fifo_path"], os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
     except OSError as exc:
@@ -312,14 +324,17 @@ def _relay_frames(recording: dict[str, Any]) -> None:
     end_reason: str | None = None
     try:
         while True:
-            header, reason = _read_frame_header(fd, stop_event, ready_path, recording["tap_pid"])
+            header, reason = _read_frame_header(recording, fd, stop_event)
             if header is None:
                 end_reason = reason
                 break
-            magic, version, header_len, width, height, stride, fourcc, bottom_up, seq, _ = FRAME_HEADER.unpack(header)
-            if magic != FRAME_MAGIC or version != FRAME_VERSION or header_len != FRAME_HEADER.size:
-                recording["relay_error"] = "Frame tap stream lost header alignment; recording ended early."
-                end_reason = "misaligned"
+            _, version, header_len, width, height, stride, fourcc, bottom_up, seq, time_ns = FRAME_HEADER.unpack(header)
+            if version != FRAME_VERSION or header_len != FRAME_HEADER.size:
+                recording["relay_error"] = (
+                    f"Frame tap protocol mismatch (version={version}, header_len={header_len}); "
+                    "recording ended early."
+                )
+                end_reason = "protocol"
                 break
             if fourcc != FOURCC_BGRA or bottom_up != 1 or stride != width * 4:
                 recording["relay_error"] = (
@@ -349,11 +364,31 @@ def _relay_frames(recording: dict[str, Any]) -> None:
             if expected is not None and seq > expected:
                 recording["drops"] += seq - expected
             recording["next_seq"] = seq + 1
+            # Wall-clock timestamps are ffmpeg's read times, so reads must
+            # track capture times. Frames buffered while ffmpeg spun up (it
+            # spawns on the first frame and reads nothing until initialized)
+            # would otherwise drain as one burst and compress the head of the
+            # timeline. Replay every later frame on its own time_ns grid,
+            # anchored when the first frame reached a reading encoder — the
+            # grid is relative, so it stays clock-agnostic.
+            base = recording["pace_base"]
+            if base is not None:
+                target = base[1] + max(0.0, (time_ns - base[0]) / 1e9)
+                while not stop_event.is_set():
+                    remaining = target - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(remaining, 0.2))
+                if stop_event.is_set():
+                    end_reason = "stopped"
+                    break
             reason = _splice_payload(fd, encoder, stride * height, stop_event)
             if reason is not None:
                 end_reason = reason
                 break
             recording["frames"] += 1
+            if recording["pace_base"] is None:
+                recording["pace_base"] = (time_ns, time.monotonic())
         recording["end_reason"] = end_reason
     finally:
         os.close(fd)
@@ -468,6 +503,18 @@ async def handle_start_recording(arguments: dict) -> list[TextContent]:
                 "runtimes without it."
             ),
         )]
+    launch_pid = launch.get("pid")
+    if launch_pid is not None and tap_pid != launch_pid:
+        # The marker is a previous simulator's leftover on the same path; the
+        # current launch's tap either never started or wrote elsewhere.
+        return [TextContent(
+            type="text",
+            text=(
+                f"Real-time recording is unavailable: the frame tap marker belongs to simulator "
+                f"pid {tap_pid}, but this launch is pid {launch_pid}. Run the project again and "
+                "retry."
+            ),
+        )]
 
     ffmpeg = _find_binary("ffmpeg")
     if not ffmpeg:
@@ -511,6 +558,8 @@ async def handle_start_recording(arguments: dict) -> list[TextContent]:
         "frames": 0,
         "drops": 0,
         "next_seq": None,
+        "resync_bytes": 0,
+        "pace_base": None,
         "end_reason": None,
         "resized_to": None,
         "relay_error": None,
@@ -574,6 +623,11 @@ def _recording_notes(recording: dict[str, Any], code: int) -> list[str]:
     end_reason = recording.get("end_reason")
     if recording.get("relay_error"):
         notes.append(recording["relay_error"])
+    if recording.get("resync_bytes"):
+        notes.append(
+            f"The relay skipped {recording['resync_bytes']} misaligned stream bytes "
+            "mid-recording and resynchronized on the next frame header."
+        )
     if end_reason == "resized":
         notes.append(
             "The recording ended early: the window was resized to "

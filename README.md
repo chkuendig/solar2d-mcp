@@ -330,7 +330,9 @@ recorder instead:
 
 The recorder does not touch a display server. The launcher points the
 simulator's offscreen frame tap (`SOLAR2D_VIDEO_PIPE`) at a FIFO in the shared
-runtime directory, and a relay thread streams the tap's framed BGRA frames
+runtime directory and raises the tap's frame cap (`SOLAR2D_VIDEO_FPS`) to the
+highest fps a recording may request, so the requested fps is always governed by
+the output side alone. A relay thread streams the tap's framed BGRA frames
 into ffmpeg: GL's bottom-up rows are flipped, dimensions are cropped to even
 yuv420p sizes, and H.264 is encoded at a constant frame rate using wall-clock
 timestamps, so dropped frames never compress the timeline. The duration
@@ -338,7 +340,9 @@ argument is a safety ceiling; stopping early is the normal workflow.
 
 The stop report includes the frames the tap produced and how many it dropped
 (sequence gaps: frames the tap itself skipped under backpressure, not frames
-held back by the fps cap). Recordings are written as fragmented MP4 with a
+held back by the fps cap). The relay's drop count and the engine tap's own
+drop counter count the same events and should always match; a mismatch is a
+bug in one of them. Recordings are written as fragmented MP4 with a
 one-second fragment cadence, so even a hard-killed run leaves the captured
 frames in a playable file with at most about a second unflushed. If the
 window is resized mid-recording, the MP4 is finalized at the original size and

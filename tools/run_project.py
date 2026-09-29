@@ -19,6 +19,7 @@ from mcp.types import TextContent, Tool
 import config
 from runtime import _VIDEO_PIPE_PATH, stop_tracked_simulators, take_finished_recording
 from runtime import _stop_process as stop_process
+from tools.video import MAX_FPS
 from utils import find_main_lua, get_current_launch, running_projects
 
 LAUNCH_TIMEOUT_SECONDS = 20.0
@@ -1172,8 +1173,11 @@ def _prepare_and_spawn(
         launch["started_at_ns"] = time.time_ns()
         # The simulator streams its frames to the runtime dir's video FIFO when
         # this env var points at it; everything else is inherited unchanged.
+        # The tap's cap is raised to the highest fps a recording may request so
+        # it never throttles below the MCP's output-side reduction (-r).
         simulator_env = os.environ.copy()
         simulator_env["SOLAR2D_VIDEO_PIPE"] = str(_VIDEO_PIPE_PATH)
+        simulator_env["SOLAR2D_VIDEO_FPS"] = str(MAX_FPS)
         process = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,

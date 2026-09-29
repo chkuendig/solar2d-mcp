@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import tempfile
 import threading
 import time
@@ -12,7 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 import runtime
-from tools import run_project, touch
+from tools import run_project, touch, video
 from utils import running_projects
 
 
@@ -423,6 +424,33 @@ class LaunchReadinessTests(unittest.TestCase):
 
         self.assertFalse(logger.exists())
         self.assertFalse(screenshot.exists())
+
+    def test_spawn_sets_video_tap_environment(self) -> None:
+        project = make_project(self.tmp_path)
+        process = FakeProcess(pid=654321)
+
+        with (
+            mock.patch.object(run_project, "stop_tracked_simulators"),
+            mock.patch.object(run_project, "_ensure_relaunch_on_file_change"),
+            mock.patch.object(run_project.subprocess, "Popen", return_value=process) as popen,
+        ):
+            launch = run_project._prepare_and_spawn(
+                cmd=["simulator"],
+                project_dir=str(project),
+                project_name="project",
+                main_lua_path=str(project / "main.lua"),
+                log_file=str(self.tmp_path / "corona.log"),
+                launch_id="env-launch",
+                cancelled=threading.Event(),
+            )
+
+        self.assertEqual(launch["pid"], 654321)
+        env = popen.call_args.kwargs["env"]
+        self.assertEqual(env["SOLAR2D_VIDEO_PIPE"], str(runtime._VIDEO_PIPE_PATH))
+        # The tap's cap is raised to the highest fps a recording may request;
+        # the output side does any reduction.
+        self.assertEqual(env["SOLAR2D_VIDEO_FPS"], str(video.MAX_FPS))
+        self.assertEqual(env.get("PATH"), os.environ.get("PATH"))
 
     def test_cleanup_is_process_and_launch_scoped(self) -> None:
         first_project = make_project(self.tmp_path / "first")

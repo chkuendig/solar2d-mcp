@@ -128,7 +128,14 @@ class FakeTap:
         return self
 
     def send_frame(self, width: int, height: int, seq: int) -> None:
-        self.commands.put((width, height, seq))
+        # Stamp at enqueue time, like the engine stamps at capture: stamping
+        # in the writer thread would inflate timestamps by whatever the writer
+        # trails live time (FIFO backpressure) and feed back into the relay's
+        # replay pacing.
+        self.commands.put(("raw", build_frame(width, height, seq)))
+
+    def send_raw(self, data: bytes) -> None:
+        self.commands.put(("raw", data))
 
     def finish(self, timeout: float = 5.0) -> None:
         self.commands.put(None)
@@ -150,8 +157,7 @@ class FakeTap:
                 command = self.commands.get()
                 if command is None:
                     break
-                width, height, seq = command
-                data = build_frame(width, height, seq)
+                data = command[1]
                 while data:
                     data = data[os.write(fd, data):]
         except OSError as exc:
@@ -269,6 +275,39 @@ class VideoRecordingTests(unittest.TestCase):
         self.assertIn("requires a runtime", result[0].text)
         self.assertNotIn("video_recording", self.launch)
 
+    def test_marker_from_a_different_simulator_is_rejected(self) -> None:
+        self.taps.append(FakeTap(self.root).start())  # marker carries this test's pid
+        self.launch["pid"] = os.getpid() + 1
+        with mock.patch.object(video, "_find_binary", return_value="/usr/bin/ffmpeg"):
+            result = asyncio.run(video.handle_start_recording({"project_path": str(self.project)}))
+
+        self.assertIn("belongs to simulator pid", result[0].text)
+        self.assertNotIn("video_recording", self.launch)
+
+    def test_relay_resyncs_after_a_torn_frame(self) -> None:
+        recording = self._start_recording(write_fake_ffmpeg(self.root))
+        for seq in range(3):
+            self.taps[0].send_frame(64, 48, seq)
+        self._wait_for(lambda: recording["frames"] == 3, "frames before the tear")
+        # Simulate a torn write: junk bytes where a header should be, then a
+        # resumption of well-formed frames (e.g. a leftover from an earlier
+        # reader on the same pipe).
+        self.taps[0].send_raw(b"\xde\xad" * 20)
+        for seq in range(10, 13):
+            self.taps[0].send_frame(64, 48, seq)
+        self._wait_for(lambda: recording["frames"] == 6, "frames after resync")
+        self.taps[0].finish()
+
+        with (
+            mock.patch.object(video, "_find_binary", return_value="/usr/bin/ffprobe"),
+            mock.patch.object(video, "_probe_video", return_value=valid_probe()),
+        ):
+            result = asyncio.run(video.handle_stop_recording({"project_path": str(self.project)}))
+
+        self.assertIn("finalized and verified", result[0].text)
+        self.assertEqual(recording["resync_bytes"], 40)
+        self.assertIn("skipped 40 misaligned stream bytes", result[0].text)
+
     def test_start_reports_missing_ffmpeg(self) -> None:
         self.taps.append(FakeTap(self.root).start())
         with mock.patch.object(video, "_find_binary", return_value=None):
@@ -290,6 +329,9 @@ class VideoRecordingTests(unittest.TestCase):
         self.assertEqual(command[command.index("-r") + 1], "15")
         self.assertIn("pipe:0", command)
         self.assertIn("vflip,crop=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p", command)
+        # Wall-clock timestamps are a demuxer option: they must precede -i or
+        # ffmpeg silently applies them to the output context instead.
+        self.assertLess(command.index("-use_wallclock_as_timestamps"), command.index("-i"))
         self.assertEqual(
             command[command.index("-movflags") + 1], "+frag_keyframe+empty_moov+default_base_moof"
         )
@@ -498,6 +540,46 @@ class VideoRecordingTests(unittest.TestCase):
         probe = video._probe_video(out_path, shutil.which("ffprobe"))
         self.assertGreater(probe["frames"], 0)
         self.assertGreater(probe["duration"], 0.0)
+
+    @unittest.skipIf(
+        shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+        "ffmpeg and ffprobe are required",
+    )
+    def test_recorded_duration_tracks_wall_clock(self) -> None:
+        self.taps.append(FakeTap(self.root).start())
+        result = asyncio.run(video.handle_start_recording({
+            "project_path": str(self.project),
+            "duration": 30,
+            "fps": 30,
+            "filename": "honest.mp4",
+        }))
+        self.assertIn("recording started", result[0].text)
+        recording = self.launch["video_recording"]
+
+        # Emit at 20 fps — deliberately off the requested 30 — with a pause in
+        # the middle: only wall-clock input timestamps keep the MP4's timeline
+        # faithful to the real pacing.
+        started = time.monotonic()
+        seq = 0
+        for _ in range(30):
+            self.taps[0].send_frame(64, 48, seq)
+            seq += 1
+            time.sleep(0.05)
+        time.sleep(1.2)
+        for _ in range(20):
+            self.taps[0].send_frame(64, 48, seq)
+            seq += 1
+            time.sleep(0.05)
+        wall = time.monotonic() - started
+        self._wait_for(lambda: recording["frames"] == 50, "all frames relayed")
+        self.taps[0].finish()
+
+        result = asyncio.run(video.handle_stop_recording({"project_path": str(self.project)}))
+        self.assertIn("finalized and verified", result[0].text)
+        probe = video._probe_video(Path(recording["out_path"]), shutil.which("ffprobe"))
+        detail = f"duration={probe['duration']:.3f} frames={probe['frames']} wall={wall:.3f}"
+        self.assertGreater(probe["duration"], wall * 0.9, detail)
+        self.assertLess(probe["duration"], wall * 1.1, detail)
 
     def test_probe_parses_ffprobe_json(self) -> None:
         payload = {
