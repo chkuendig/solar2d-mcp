@@ -7,6 +7,7 @@ import json
 import os
 import queue
 import shutil
+import signal
 import struct
 import tempfile
 import threading
@@ -24,8 +25,10 @@ from utils import running_projects
 FRAME_HEADER = struct.Struct("<4sHHIII4sB7xQQ16x")
 
 
-def build_frame(width: int, height: int, seq: int) -> bytes:
-    payload = bytes([(0x30 + seq) % 0x100]) * (width * height * 4)
+def build_frame(width: int, height: int, seq: int, noisy: bool = False) -> bytes:
+    # Noise gives the encoder a hard content cut, which only matters when
+    # scenecut is active; the test budget also covers the GOP cadence alone.
+    payload = os.urandom(width * height * 4) if noisy else bytes([(0x30 + seq) % 0x100]) * (width * height * 4)
     header = FRAME_HEADER.pack(
         b"S2VT", 1, FRAME_HEADER.size, width, height, width * 4, b"BGRA", 1, seq, time.time_ns()
     )
@@ -43,6 +46,13 @@ def write_fake_ffmpeg(root: Path) -> str:
     )
     script.chmod(0o755)
     return str(script)
+
+
+def _read_bytes(path: Path) -> bytes:
+    try:
+        return path.read_bytes()
+    except OSError:
+        return b""
 
 
 def valid_probe(frames: int = 90, duration: float = 3.0, width: int = 64, height: int = 48) -> dict:
@@ -119,8 +129,8 @@ class FakeTap:
         self.thread.start()
         return self
 
-    def send_frame(self, width: int, height: int, seq: int) -> None:
-        self.commands.put((width, height, seq))
+    def send_frame(self, width: int, height: int, seq: int, noisy: bool = False) -> None:
+        self.commands.put((width, height, seq, noisy))
 
     def finish(self, timeout: float = 5.0) -> None:
         self.commands.put(None)
@@ -142,8 +152,8 @@ class FakeTap:
                 command = self.commands.get()
                 if command is None:
                     break
-                width, height, seq = command
-                data = build_frame(width, height, seq)
+                width, height, seq, noisy = command
+                data = build_frame(width, height, seq, noisy)
                 while data:
                     data = data[os.write(fd, data):]
         except OSError as exc:
@@ -282,6 +292,9 @@ class VideoRecordingTests(unittest.TestCase):
         self.assertEqual(command[command.index("-r") + 1], "15")
         self.assertIn("pipe:0", command)
         self.assertIn("vflip,crop=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p", command)
+        self.assertEqual(
+            command[command.index("-movflags") + 1], "+frag_keyframe+empty_moov+default_base_moof"
+        )
         self.taps[0].finish()
 
     def test_drops_are_counted_from_sequence_gaps(self) -> None:
@@ -446,6 +459,47 @@ class VideoRecordingTests(unittest.TestCase):
         self.assertIn("Dimensions: 64x48", result[0].text)
         self.assertIn("(0 dropped)", result[0].text)
         self.assertGreater(Path(recording["out_path"]).stat().st_size, 0)
+
+    @unittest.skipIf(
+        shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+        "ffmpeg and ffprobe are required",
+    )
+    def test_sigkilled_encoder_still_leaves_a_playable_mp4(self) -> None:
+        self.taps.append(FakeTap(self.root).start())
+        result = asyncio.run(video.handle_start_recording({
+            "project_path": str(self.project),
+            "duration": 30,
+            "filename": "killed.mp4",
+        }))
+        self.assertIn("recording started", result[0].text)
+        recording = self.launch["video_recording"]
+        self.taps[0].send_frame(64, 48, 0)
+        seq = 1
+        self._wait_for(lambda: recording["process"] is not None, "encoder spawn")
+        out_path = Path(recording["out_path"])
+
+        for _ in range(14):
+            self.taps[0].send_frame(64, 48, seq)
+            seq += 1
+            time.sleep(0.033)
+        # ultrafast runs with rc-lookahead=0, so scenecut cannot fire and the
+        # first fragment closes at x264's default keyint (250 frames, ~8s at
+        # 30 fps); the noisy cut would only pull it earlier under other
+        # encode settings. The wait budget covers the full GOP.
+        deadline = time.monotonic() + 15.0
+        while b"moof" not in _read_bytes(out_path) and time.monotonic() < deadline:
+            self.taps[0].send_frame(64, 48, seq, noisy=True)
+            seq += 1
+            time.sleep(0.033)
+        self.assertIn(b"moof", _read_bytes(out_path), "no fragment closed before the kill")
+
+        os.kill(recording["process"].pid, signal.SIGKILL)
+        result = asyncio.run(video.handle_stop_recording({"project_path": str(self.project)}))
+
+        self.assertIn("finalized and verified", result[0].text)
+        probe = video._probe_video(out_path, shutil.which("ffprobe"))
+        self.assertGreater(probe["frames"], 0)
+        self.assertGreater(probe["duration"], 0.0)
 
     def test_probe_parses_ffprobe_json(self) -> None:
         payload = {

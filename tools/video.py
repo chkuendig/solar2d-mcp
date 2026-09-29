@@ -240,8 +240,11 @@ def _encoder_command(
         "ultrafast",
         "-crf",
         "20",
+        # Fragmented MP4: a hard-killed run (CI hang detector, crash) still
+        # leaves every closed moof fragment playable; faststart's finalize-time
+        # rewrite would never happen.
         "-movflags",
-        "+faststart",
+        "+frag_keyframe+empty_moov+default_base_moof",
         "-t",
         str(duration),
         str(out_path),
@@ -315,6 +318,8 @@ def _relay_frames(recording: dict[str, Any]) -> None:
                 end_reason = "unsupported-frame"
                 break
             if encoder is None:
+                # The header's size is the drawable surface (window plus menu
+                # bar height), so it is taken verbatim as the encode size.
                 encoder = _spawn_encoder(recording, width, height)
                 if encoder is None:
                     end_reason = "encoder-start-failed"
@@ -327,6 +332,9 @@ def _relay_frames(recording: dict[str, Any]) -> None:
                 recording["resized_to"] = f"{width}x{height}"
                 end_reason = "resized"
                 break
+            # Seq is assigned per emitted frame, so a gap always means the tap
+            # itself dropped that frame under backpressure — never that the fps
+            # cap skipped staging a frame.
             expected = recording["next_seq"]
             if expected is not None and seq > expected:
                 recording["drops"] += seq - expected

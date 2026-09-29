@@ -337,10 +337,13 @@ timestamps, so dropped frames never compress the timeline. The duration
 argument is a safety ceiling; stopping early is the normal workflow.
 
 The stop report includes the frames the tap produced and how many it dropped
-(sequence gaps). If the window is resized mid-recording, the MP4 is finalized
-at the original size and the stop report says so. A simulator relaunch
-finalizes any active recording; the next `stop_video_recording` on that
-project reports it instead of reporting nothing.
+(sequence gaps: frames the tap itself skipped under backpressure, not frames
+held back by the fps cap). Recordings are written as fragmented MP4, so even a
+hard-killed run leaves the frames captured so far in a playable file. If the
+window is resized mid-recording, the MP4 is finalized at the original size and
+the stop report says so. A simulator relaunch finalizes any active recording;
+the next `stop_video_recording` on that project reports it instead of
+reporting nothing.
 
 ## Touch Interaction
 
