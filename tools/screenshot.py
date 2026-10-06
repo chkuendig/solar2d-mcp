@@ -5,13 +5,14 @@ Screenshot tools - Control screenshot recording and retrieve captured images.
 import asyncio
 import base64
 import os
+import re
 import shutil
-import tempfile
+import uuid
 from pathlib import Path
 
 from mcp.types import ImageContent, TextContent, Tool
 
-from utils import find_main_lua
+from utils import get_current_launch, write_launch_control
 
 # Hard ceiling on a single recording, mirrored in the injected capture loop
 # (run_project.py: MAX_RECORDING_SECONDS). The Lua loop enforces it too, so a
@@ -119,7 +120,7 @@ ENCODE_VIDEO_TOOL = Tool(
             },
             "filename": {
                 "type": "string",
-                "description": "Output file name (\".mp4\" appended if missing). Written to a 'video/' subdir of the screenshot dir. (default: recording.mp4)",
+                "description": "Output file name (\".mp4\" appended if missing). Written to SOLAR2D_MCP_ARTIFACT_DIR when configured, otherwise the screenshot video directory.",
                 "default": "recording.mp4"
             }
         },
@@ -131,21 +132,16 @@ ENCODE_VIDEO_TOOL = Tool(
 TOOLS = [START_RECORDING_TOOL, STOP_RECORDING_TOOL, GET_SCREENSHOT_TOOL, LIST_SCREENSHOTS_TOOL, ENCODE_VIDEO_TOOL]
 
 
-def _get_project_name(project_path: str) -> str:
-    """Get the project name from the path."""
-    main_lua_path = find_main_lua(project_path)
-    project_dir = str(Path(main_lua_path).parent)
-    return Path(project_dir).name
+# A recorded frame, as opposed to an on-demand capture or a stray file.
+RECORDED = re.compile(r"^screenshot_\d+\.jpg$")
 
 
-def _get_screenshot_dir(project_name: str) -> str:
-    """Get the screenshot directory path."""
-    return os.path.join(tempfile.gettempdir(), f"solar2d_screenshots_{project_name}")
-
-
-def _get_control_file(project_name: str) -> str:
-    """Get the control file path."""
-    return os.path.join(tempfile.gettempdir(), f"solar2d_screenshots_{project_name}.control")
+def _get_video_dir(screenshot_dir: str) -> str:
+    """Return a host-exportable video directory when one is configured."""
+    artifact_dir = os.environ.get("SOLAR2D_MCP_ARTIFACT_DIR")
+    if artifact_dir:
+        return os.path.abspath(os.path.expanduser(artifact_dir))
+    return os.path.join(screenshot_dir, "video")
 
 
 def _find_ffmpeg() -> str | None:
@@ -167,20 +163,23 @@ async def handle_start_recording(arguments: dict) -> list[TextContent]:
     if not project_path:
         return [TextContent(type="text", text="Error: project_path is required")]
 
-    project_name = _get_project_name(project_path)
-    control_file = _get_control_file(project_name)
-    screenshot_dir = _get_screenshot_dir(project_name)
+    launch, error = get_current_launch(project_path)
+    if error:
+        return [TextContent(type="text", text=f"Error: {error}")]
+    assert launch is not None
 
     # Cap duration at the hard ceiling (the Lua loop enforces it too).
     duration = min(int(duration), MAX_RECORDING_SECONDS)
 
-    # Write duration to control file
-    with open(control_file, 'w') as f:
-        f.write(str(duration))
+    write_launch_control(
+        launch["screenshot_control_file"],
+        launch["launch_id"],
+        str(duration),
+    )
 
     return [TextContent(
         type="text",
-        text=f"Screenshot recording started!\n\nDuration: {duration} seconds\nInterval: 100ms (10 fps)\nScreenshots will be saved to: {screenshot_dir}\n\nUse get_simulator_screenshot to view captured images.\nUse stop_screenshot_recording to stop early."
+        text=f"Screenshot recording started!\n\nDuration: {duration} seconds\nInterval: 100ms (10 fps)\nScreenshots will be saved to: {launch['screenshot_dir']}\n\nUse get_simulator_screenshot to view captured images.\nUse stop_screenshot_recording to stop early."
     )]
 
 
@@ -191,12 +190,16 @@ async def handle_stop_recording(arguments: dict) -> list[TextContent]:
     if not project_path:
         return [TextContent(type="text", text="Error: project_path is required")]
 
-    project_name = _get_project_name(project_path)
-    control_file = _get_control_file(project_name)
+    launch, error = get_current_launch(project_path)
+    if error:
+        return [TextContent(type="text", text=f"Error: {error}")]
+    assert launch is not None
 
-    # Write 0 to control file to stop recording
-    with open(control_file, 'w') as f:
-        f.write("0")
+    write_launch_control(
+        launch["screenshot_control_file"],
+        launch["launch_id"],
+        "0",
+    )
 
     return [TextContent(
         type="text",
@@ -212,40 +215,47 @@ async def handle_get_screenshot(arguments: dict) -> list[TextContent | ImageCont
     if not project_path:
         return [TextContent(type="text", text="Error: project_path is required")]
 
-    project_name = _get_project_name(project_path)
-    screenshot_dir = _get_screenshot_dir(project_name)
-    control_file = _get_control_file(project_name)
+    launch, error = get_current_launch(project_path)
+    if error:
+        return [TextContent(type="text", text=f"Error: {error}")]
+    assert launch is not None
+    screenshot_dir = launch["screenshot_dir"]
 
     # Handle "latest" - capture fresh screenshot on demand
     if which == "latest":
         # Ensure screenshot dir exists
         os.makedirs(screenshot_dir, exist_ok=True)
 
-        # Write "now" command to trigger immediate capture
-        with open(control_file, 'w') as f:
-            f.write("now")
+        # Ask for a filename that has never existed: it appearing means this
+        # capture is done and written. The leading letter keeps it out of
+        # RECORDED, which an all-digit token would otherwise match.
+        token = "x" + uuid.uuid4().hex[:11]
+        write_launch_control(
+            launch["screenshot_control_file"],
+            launch["launch_id"],
+            f"now:{token}",
+        )
 
-        # Wait for the screenshot to be captured (polling interval is 500ms)
-        latest_file = os.path.join(screenshot_dir, "screenshot_latest.jpg")
-        # Get current mtime if file exists
-        old_mtime = os.path.getmtime(latest_file) if os.path.exists(latest_file) else 0
+        target = os.path.join(screenshot_dir, f"screenshot_{token}.jpg")
 
-        # Wait up to 2 seconds for new screenshot
-        for _ in range(20):
+        # The Lua side polls every 500ms and then needs a render frame.
+        for _ in range(50):
             await asyncio.sleep(0.1)
-            if os.path.exists(latest_file):
-                new_mtime = os.path.getmtime(latest_file)
-                if new_mtime > old_mtime:
-                    # New screenshot captured
+            if os.path.exists(target):
+                try:
+                    with open(target, 'rb') as f:
+                        image_data = base64.standard_b64encode(f.read()).decode('utf-8')
+                except Exception as e:
+                    return [TextContent(type="text", text=f"Error reading screenshot: {str(e)}")]
+                finally:
+                    # One capture, one file, and the caller has it now.
                     try:
-                        with open(latest_file, 'rb') as f:
-                            image_data = base64.standard_b64encode(f.read()).decode('utf-8')
-
-                        return [
-                            ImageContent(type="image", data=image_data, mimeType="image/jpeg")
-                        ]
-                    except Exception as e:
-                        return [TextContent(type="text", text=f"Error reading screenshot: {str(e)}")]
+                        os.remove(target)
+                    except OSError:
+                        pass
+                return [
+                    ImageContent(type="image", data=image_data, mimeType="image/jpeg")
+                ]
 
         return [TextContent(
             type="text",
@@ -258,10 +268,9 @@ async def handle_get_screenshot(arguments: dict) -> list[TextContent | ImageCont
             text=f"Screenshot directory not found: {screenshot_dir}\n\nMake sure to run the project first with run_solar2d_project."
         )]
 
-    # Get list of recorded screenshots (exclude screenshot_latest.jpg)
+    # Match the numbered shape rather than excluding one known name.
     screenshots = sorted([
-        f for f in os.listdir(screenshot_dir)
-        if f.startswith("screenshot_") and f.endswith(".jpg") and f != "screenshot_latest.jpg"
+        f for f in os.listdir(screenshot_dir) if RECORDED.match(f)
     ])
 
     # Handle "last" - get most recent from recording
@@ -352,12 +361,15 @@ async def handle_encode_video(arguments: dict) -> list[TextContent]:
 
     fps = max(1, int(arguments.get("fps", 10)))
     width = int(arguments.get("width", 560))
-    filename = str(arguments.get("filename", "recording.mp4"))
+    filename = Path(str(arguments.get("filename", "recording.mp4"))).name
     if not filename.lower().endswith(".mp4"):
         filename += ".mp4"
 
-    project_name = _get_project_name(project_path)
-    screenshot_dir = _get_screenshot_dir(project_name)
+    launch, error = get_current_launch(project_path)
+    if error:
+        return [TextContent(type="text", text=f"Error: {error}")]
+    assert launch is not None
+    screenshot_dir = launch["screenshot_dir"]
     if not os.path.exists(screenshot_dir):
         return [TextContent(
             type="text",
@@ -367,7 +379,7 @@ async def handle_encode_video(arguments: dict) -> list[TextContent]:
     # Frame numbers present (the recorder writes them contiguously as screenshot_NNN.jpg).
     nums = []
     for f in os.listdir(screenshot_dir):
-        if f.startswith("screenshot_") and f.endswith(".jpg") and f != "screenshot_latest.jpg":
+        if RECORDED.match(f):
             try:
                 nums.append(int(f[len("screenshot_"):-len(".jpg")]))
             except ValueError:
@@ -395,10 +407,11 @@ async def handle_encode_video(arguments: dict) -> list[TextContent]:
     if not ffmpeg:
         return [TextContent(
             type="text",
-            text="ffmpeg not found (checked PATH and Homebrew/system paths). Install it: brew install ffmpeg."
+            text="ffmpeg not found (checked PATH and the usual Homebrew/system paths). "
+                 "Install it: brew install ffmpeg (macOS), apt-get install ffmpeg (Debian/Ubuntu)."
         )]
 
-    video_dir = os.path.join(screenshot_dir, "video")
+    video_dir = _get_video_dir(screenshot_dir)
     os.makedirs(video_dir, exist_ok=True)
     out_path = os.path.join(video_dir, filename)
 
@@ -444,8 +457,11 @@ async def handle_list_screenshots(arguments: dict) -> list[TextContent]:
     if not project_path:
         return [TextContent(type="text", text="Error: project_path is required")]
 
-    project_name = _get_project_name(project_path)
-    screenshot_dir = _get_screenshot_dir(project_name)
+    launch, error = get_current_launch(project_path)
+    if error:
+        return [TextContent(type="text", text=f"Error: {error}")]
+    assert launch is not None
+    screenshot_dir = launch["screenshot_dir"]
 
     if not os.path.exists(screenshot_dir):
         return [TextContent(

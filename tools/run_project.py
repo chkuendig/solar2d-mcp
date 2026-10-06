@@ -2,16 +2,31 @@
 run_solar2d_project tool - Run a Solar2D project in the simulator.
 """
 
+import asyncio
+import json
 import os
-import signal
+import platform
 import subprocess
 import tempfile
+import threading
+import time
+import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 from mcp.types import TextContent, Tool
 
 import config
-from utils import find_main_lua, running_projects
+from runtime import _VIDEO_PIPE_PATH, stop_tracked_simulators, take_finished_recording
+from runtime import _stop_process as stop_process
+from tools.video import MAX_FPS
+from utils import find_main_lua, get_current_launch, running_projects
+
+LAUNCH_TIMEOUT_SECONDS = 20.0
+READINESS_POLL_SECONDS = 0.05
+_launch_lock: asyncio.Lock | None = None
+_launch_lock_loop: asyncio.AbstractEventLoop | None = None
+
 
 TOOL = Tool(
     name="run_solar2d_project",
@@ -31,6 +46,16 @@ TOOL = Tool(
             "no_console": {
                 "type": "boolean",
                 "description": "Disable console output (default: false to capture logs)",
+                "default": False
+            },
+            "reload": {
+                "type": "boolean",
+                "description": (
+                    "Reload the already-running simulator in place instead of "
+                    "restarting it (default: false). Falls back to a fresh "
+                    "spawn automatically if no live simulator is tracked for "
+                    "this project."
+                ),
                 "default": False
             }
         },
@@ -85,14 +110,16 @@ print("[MCP] Logging initialized - output will be captured for Claude")
     return logger_path
 
 
-def create_screenshot_module(project_dir: str, project_name: str) -> str:
+def create_screenshot_module(project_dir: str, project_name: str, launch_id: str) -> str:
     """Create a Lua file that captures screenshots on demand."""
-    screenshot_dir = os.path.join(tempfile.gettempdir(), f"solar2d_screenshots_{project_name}")
-    control_file = os.path.join(tempfile.gettempdir(), f"solar2d_screenshots_{project_name}.control")
+    launch_name = f"{project_name}_{launch_id}"
+    screenshot_dir = os.path.join(tempfile.gettempdir(), f"solar2d_screenshots_{launch_name}")
+    control_file = os.path.join(tempfile.gettempdir(), f"solar2d_screenshots_{launch_name}.control")
 
     lua_screenshot = f'''
 -- MCP Screenshot: Captures screenshots periodically when recording is enabled
 local lfs = require("lfs")
+local launchId = "{launch_id}"
 local screenshotDir = "{screenshot_dir}"
 local controlFile = "{control_file}"
 local captureInterval = 100  -- 100ms between captures
@@ -120,7 +147,11 @@ local function readControlFile()
         local content = file:read("*all")
         file:close()
         os.remove(controlFile)  -- Consume the command
-        return content
+        local token, command = content:match("^([^\\n]+)\\n(.*)$")
+        if token == launchId then
+            return command
+        end
+        print("[MCP Screenshot] Ignored control command for another launch")
     end
     return nil
 end
@@ -142,18 +173,71 @@ local function isRecording()
     return system.getTimer() < recordingEndTime
 end
 
--- Helper to copy file (works across volumes)
-local function copyFile(src, dst)
+-- Publish across a filesystem boundary, where rename fails EXDEV: copy beside
+-- the destination and rename within that directory. Returns nil on success.
+local function copyThenRename(src, finalPath)
     local infile = io.open(src, "rb")
-    if not infile then return false end
+    if not infile then return "staged capture disappeared" end
     local content = infile:read("*all")
     infile:close()
 
-    local outfile = io.open(dst, "wb")
-    if not outfile then return false end
+    local nearby = finalPath .. ".part"
+    local outfile = io.open(nearby, "wb")
+    if not outfile then return "cannot write to " .. tostring(finalPath) end
     outfile:write(content)
     outfile:close()
-    return true
+
+    local ok, err = os.rename(nearby, finalPath)
+    if not ok then
+        os.remove(nearby)
+        return tostring(err)
+    end
+    return nil
+end
+
+-- Publish a capture under its final name, atomically. display.save() writes on
+-- a later render frame, so this waits for the staged file to exist and be
+-- non-empty; the rename is what the reader sees, so never a partial image.
+local function publishWhenReady(stagedName, finalPath, label)
+    local tries = 0
+    local function attempt()
+        tries = tries + 1
+        local staged = system.pathForFile(stagedName, system.TemporaryDirectory)
+        local ready = false
+        if staged then
+            local f = io.open(staged, "rb")
+            if f then
+                -- A file that exists but is still empty is a capture mid-flight.
+                ready = (f:seek("end") or 0) > 0
+                f:close()
+            end
+        end
+        if ready then
+            if not os.rename(staged, finalPath) then
+                local err = copyThenRename(staged, finalPath)
+                if err then
+                    print("[MCP Screenshot] Warning: could not publish " .. tostring(label) ..
+                          ": " .. tostring(err))
+                end
+            end
+            os.remove(staged)
+            return true
+        end
+        if tries >= 30 then   -- ~half a second at 60fps; something is wrong
+            print("[MCP Screenshot] Warning: capture never appeared for " .. tostring(label))
+            -- An empty staged file may still be lying there.
+            if staged then os.remove(staged) end
+            return true
+        end
+        return false
+    end
+
+    local function onFrame()
+        if attempt() then
+            Runtime:removeEventListener("enterFrame", onFrame)
+        end
+    end
+    Runtime:addEventListener("enterFrame", onFrame)
 end
 
 -- Capture screenshot
@@ -163,45 +247,34 @@ local function captureScreen()
     screenshotCount = screenshotCount + 1
     local filename = string.format("screenshot_%03d.jpg", screenshotCount)
     local fullPath = screenshotDir .. "/" .. filename
+    -- Still .jpg: Solar2D picks the encoder from the extension.
+    local staged = string.format("_staging_%03d.jpg", screenshotCount)
 
-    -- Capture the display to Solar2D's temp directory
     display.save(display.currentStage, {{
-        filename = filename,
+        filename = staged,
         baseDir = system.TemporaryDirectory,
         captureOffscreenArea = false,
         isFullResolution = false
     }})
 
-    -- Copy from Solar2D temp to our /tmp/ screenshot directory
-    local tempPath = system.pathForFile(filename, system.TemporaryDirectory)
-    if tempPath then
-        if copyFile(tempPath, fullPath) then
-            os.remove(tempPath)  -- Clean up temp file
-        end
-    end
+    publishWhenReady(staged, fullPath, filename)
 end
 
--- Capture a single on-demand screenshot (not part of recording sequence)
-local function captureOnDemand()
-    local filename = "screenshot_latest.jpg"
+-- Capture on demand, published as screenshot_<k>.jpg: a name that has never
+-- existed, so the reader cannot be handed a leftover from an earlier request.
+local function captureOnDemand(k)
+    local filename = "screenshot_" .. tostring(k) .. ".jpg"
     local fullPath = screenshotDir .. "/" .. filename
+    local staged = "_staging_" .. tostring(k) .. ".jpg"
 
-    -- Capture the display to Solar2D's temp directory
     display.save(display.currentStage, {{
-        filename = filename,
+        filename = staged,
         baseDir = system.TemporaryDirectory,
         captureOffscreenArea = false,
         isFullResolution = false
     }})
 
-    -- Copy from Solar2D temp to our /tmp/ screenshot directory
-    local tempPath = system.pathForFile(filename, system.TemporaryDirectory)
-    if tempPath then
-        if copyFile(tempPath, fullPath) then
-            os.remove(tempPath)  -- Clean up temp file
-            print("[MCP Screenshot] On-demand capture saved")
-        end
-    end
+    publishWhenReady(staged, fullPath, filename)
 end
 
 -- Check control file for recording commands
@@ -209,9 +282,14 @@ local function checkControl()
     local content = readControlFile()
     if not content then return end
 
-    -- Check for "now" command (on-demand capture)
+    -- Bare "now" stays understood, for an older client.
+    local k = content:match("^now:(%w+)$")
+    if k then
+        captureOnDemand(k)
+        return
+    end
     if content == "now" then
-        captureOnDemand()
+        captureOnDemand("latest")
         return
     end
 
@@ -249,13 +327,15 @@ timer.performWithDelay(500, checkControl, 0)
     return screenshot_path
 
 
-def create_touch_module(project_dir: str, project_name: str) -> str:
+def create_touch_module(project_dir: str, project_name: str, launch_id: str) -> str:
     """Create a Lua file that handles touch simulation via control file."""
-    control_file = os.path.join(tempfile.gettempdir(), f"solar2d_touch_{project_name}.control")
-    info_file = os.path.join(tempfile.gettempdir(), f"solar2d_display_{project_name}.json")
+    launch_name = f"{project_name}_{launch_id}"
+    control_file = os.path.join(tempfile.gettempdir(), f"solar2d_touch_{launch_name}.control")
+    info_file = os.path.join(tempfile.gettempdir(), f"solar2d_display_{launch_name}.json")
 
     lua_touch = f'''
 -- MCP Touch: Simulates touch events from control file commands
+local launchId = "{launch_id}"
 local controlFile = "{control_file}"
 local infoFile = "{info_file}"
 local checkInterval = 100  -- Check for commands every 100ms
@@ -314,7 +394,11 @@ local function readControlFile()
         local content = file:read("*all")
         file:close()
         os.remove(controlFile)  -- Consume the command
-        return content
+        local token, command = content:match("^([^\\n]+)\\n(.*)$")
+        if token == launchId then
+            return command
+        end
+        print("[MCP Touch] Ignored control command for another launch")
     end
     return nil
 end
@@ -414,13 +498,20 @@ local function writeDisplayInfo()
         actualContentWidth = display.actualContentWidth,
         actualContentHeight = display.actualContentHeight,
         screenOriginX = display.screenOriginX,
-        screenOriginY = display.screenOriginY
+        screenOriginY = display.screenOriginY,
+        launchId = launchId
     }}
 
-    local file = io.open(infoFile, "w")
+    local pending = infoFile .. ".pending"
+    local file = io.open(pending, "w")
     if file then
         file:write(json.encode(info))
         file:close()
+        local ok, err = os.rename(pending, infoFile)
+        if not ok then
+            os.remove(pending)
+            print("[MCP Touch] Could not publish display readiness: " .. tostring(err))
+        end
     end
 end
 
@@ -553,7 +644,9 @@ local function checkControl()
 end
 
 -- Initialize
-writeDisplayInfo()  -- Write display info on startup
+-- A timer runs only after every top-level require in main.lua has completed.
+-- Publishing here therefore means screenshot and touch instrumentation loaded.
+timer.performWithDelay(1, writeDisplayInfo)
 print("[MCP Touch] Module initialized - listening for touch commands")
 
 -- Start polling for commands
@@ -729,23 +822,35 @@ print("[MCP Touch Overlay] Initialized - persistent visual indicators enabled")
 def inject_module_into_main_lua(main_lua_path: str, module_name: str) -> bool:
     """Inject a require statement into main.lua if not already present."""
     try:
-        with open(main_lua_path, 'r') as f:
-            content = f.read()
+        # Work in bytes so cancellation can remove our line without changing
+        # the project's original encoding or newline convention (notably CRLF
+        # projects on Linux).
+        path = Path(main_lua_path)
+        content = path.read_bytes()
 
         require_str = f'require("{module_name}")'
         require_str_single = f"require('{module_name}')"
 
         # Check if already injected
-        if require_str in content or require_str_single in content:
+        if require_str.encode() in content or require_str_single.encode() in content:
             return False  # Already present
 
-        lines = content.split('\n')
+        lines = content.splitlines(keepends=True)
+        line_text = [line.rstrip(b'\r\n').decode('utf-8', 'replace') for line in lines]
+        if b'\r\n' in content:
+            newline = b'\r\n'
+        elif b'\n' in content:
+            newline = b'\n'
+        elif b'\r' in content:
+            newline = b'\r'
+        else:
+            newline = b'\n'
 
         # Find the best insertion point
         # Look for mobdebug line, or first require, or beginning
         insert_index = 0
 
-        for i, line in enumerate(lines):
+        for i, line in enumerate(line_text):
             # Insert after mobdebug if present
             if 'mobdebug' in line.lower() and 'require' in line:
                 insert_index = i + 1
@@ -757,18 +862,17 @@ def inject_module_into_main_lua(main_lua_path: str, module_name: str) -> bool:
 
         # If no requires found, insert after initial comments/blank lines
         if insert_index == 0:
-            for i, line in enumerate(lines):
+            for i, line in enumerate(line_text):
                 stripped = line.strip()
                 if stripped and not stripped.startswith('--'):
                     insert_index = i
                     break
 
         # Insert the require line
-        lines.insert(insert_index, f'{require_str}  -- Auto-injected by MCP server')
+        lines.insert(insert_index, f'{require_str}  -- Auto-injected by MCP server'.encode() + newline)
 
         # Write back to file
-        with open(main_lua_path, 'w') as f:
-            f.write('\n'.join(lines))
+        path.write_bytes(b''.join(lines))
 
         return True  # Successfully injected
 
@@ -825,11 +929,370 @@ def inject_logger_into_main_lua(main_lua_path: str) -> bool:
         return False
 
 
-async def handle(arguments: dict) -> list[TextContent]:
+def _simulator_app_conf_path() -> Path:
+    """Path to the Linux simulator's global preferences.
+
+    ``SolarSimulator::Init`` loads these settings from the ``homescreen``
+    sandbox. Project sandboxes have a separate ``SolarAppContext`` config and
+    do not control the simulator's file-watcher policy.
+    """
+    return Path.home() / ".Solar2D" / "Sandbox" / "homescreen" / "app.conf"
+
+
+def _ensure_relaunch_on_file_change() -> None:
+    """Make the Linux simulator reload its open project on Lua file changes.
+
+    app.conf is a plain `key=value` file, not JSON, and the simulator merges
+    it into its in-memory config rather than replacing it wholesale, so
+    writing just this one key is safe even though the simulator later
+    rewrites the full file itself.
+    """
+    if platform.system() != "Linux":
+        return
+
+    conf_path = _simulator_app_conf_path()
+    pairs: dict[str, str] = {}
+    try:
+        for line in conf_path.read_text().splitlines():
+            key, sep, value = line.partition("=")
+            if sep:
+                pairs[key] = value
+    except OSError:
+        pass
+
+    if pairs.get("relaunchOnFileChange") == "Always":
+        return
+
+    pairs["relaunchOnFileChange"] = "Always"
+    conf_path.parent.mkdir(parents=True, exist_ok=True)
+    conf_path.write_text("".join(f"{key}={value}\n" for key, value in pairs.items()))
+
+
+def _touch_main_lua(main_lua_path: str) -> None:
+    """Rewrite main.lua's bytes unchanged so the simulator's file watcher
+    (inotify, non-recursive on the project root) sees a modify event on the
+    already-running project and relaunches it in place."""
+    path = Path(main_lua_path)
+    path.write_bytes(path.read_bytes())
+
+
+class _LaunchCancelled(Exception):
+    """Preparation was abandoned before its process could be handed off."""
+
+
+def _get_launch_lock() -> asyncio.Lock:
+    """Return the launch mutex for this MCP server event loop."""
+    global _launch_lock, _launch_lock_loop
+    loop = asyncio.get_running_loop()
+    if _launch_lock is None or _launch_lock_loop is not loop:
+        _launch_lock = asyncio.Lock()
+        _launch_lock_loop = loop
+    return _launch_lock
+
+
+def _launch_paths(project_name: str, launch_id: str) -> dict[str, str]:
+    launch_name = f"{project_name}_{launch_id}"
+    temp_dir = tempfile.gettempdir()
+    return {
+        "display_info_file": os.path.join(temp_dir, f"solar2d_display_{launch_name}.json"),
+        "screenshot_control_file": os.path.join(temp_dir, f"solar2d_screenshots_{launch_name}.control"),
+        "screenshot_dir": os.path.join(temp_dir, f"solar2d_screenshots_{launch_name}"),
+        "touch_control_file": os.path.join(temp_dir, f"solar2d_touch_{launch_name}.control"),
+    }
+
+
+def _remove_launch_ipc(launch: dict) -> None:
+    """Remove only files whose unguessable names belong to this launch."""
+    for key in ("display_info_file", "screenshot_control_file", "touch_control_file"):
+        value = launch.get(key)
+        if not value:
+            continue
+        path = Path(value)
+        path.unlink(missing_ok=True)
+        path.with_name(f"{path.name}.pending").unlink(missing_ok=True)
+
+
+def _helper_paths(project_dir: str) -> dict[str, str]:
+    """Return helper files owned by this launch."""
+    return {
+        "logger": os.path.join(project_dir, "_mcp_logger.lua"),
+        "screenshot": os.path.join(project_dir, "_mcp_screenshot.lua"),
+        "touch": os.path.join(project_dir, "_mcp_touch.lua"),
+        "touch_overlay": os.path.join(project_dir, "_mcp_touch_overlay.lua"),
+    }
+
+
+def _snapshot_owned_file(path: str) -> bytes | None:
+    """Capture a file's pre-launch content so cancellation can restore it."""
+    file_path = Path(path)
+    if not file_path.exists():
+        return None
+    return file_path.read_bytes()
+
+
+def _restore_owned_file(path: str, original: bytes | None, generated: bytes | None) -> None:
+    """Restore an untouched helper, leaving post-launch user edits intact."""
+    file_path = Path(path)
+    if original is None:
+        if generated is not None and file_path.exists() and file_path.read_bytes() == generated:
+            file_path.unlink()
+        return
+    if generated is not None and file_path.exists() and file_path.read_bytes() == generated:
+        file_path.write_bytes(original)
+
+
+def _remove_injected_module(main_lua_path: str, module_name: str) -> None:
+    """Remove one auto-injected require line without touching user code."""
+    path = Path(main_lua_path)
+    try:
+        content = path.read_bytes()
+    except OSError:
+        return
+
+    injected_lines = {
+        f'require("{module_name}")  -- Auto-injected by MCP server',
+        f"require('{module_name}')  -- Auto-injected by MCP server",
+        f'require("{module_name}")  -- Auto-injected by MCP server for log capture',
+        f"require('{module_name}')  -- Auto-injected by MCP server for log capture",
+    }
+    lines = content.splitlines(keepends=True)
+    removed = False
+    filtered = []
+    for line in lines:
+        line_text = line.rstrip(b"\r\n").decode("utf-8", "replace")
+        if not removed and line_text in injected_lines:
+            removed = True
+            continue
+        filtered.append(line)
+    if not removed:
+        return
+    path.write_bytes(b"".join(filtered))
+
+
+def _restore_launch_artifacts(launch: dict) -> None:
+    """Undo only the helper files and require lines created for this launch."""
+    main_lua_path = launch.get("main_lua")
+    if main_lua_path:
+        for flag, module_name in (
+            ("logger_injected", "_mcp_logger"),
+            ("screenshot_injected", "_mcp_screenshot"),
+            ("touch_injected", "_mcp_touch"),
+            ("touch_overlay_injected", "_mcp_touch_overlay"),
+        ):
+            if launch.get(flag):
+                _remove_injected_module(main_lua_path, module_name)
+
+    helper_backups = launch.get("helper_backups") or {}
+    generated_helpers = launch.get("generated_helpers") or {}
+    for path, original in helper_backups.items():
+        _restore_owned_file(path, original, generated_helpers.get(path))
+
+
+def _cleanup_launch_files(launch: dict) -> None:
+    """Restore source artifacts and remove launch-specific IPC files."""
+    try:
+        _restore_launch_artifacts(launch)
+    finally:
+        _remove_launch_ipc(launch)
+
+
+def _stop_launch(launch: dict) -> None:
+    try:
+        process = launch.get("process")
+        if process is not None:
+            stop_process(process)
+    finally:
+        _cleanup_launch_files(launch)
+
+
+def _prepare_and_spawn(
+    *,
+    cmd: list[str],
+    project_dir: str,
+    project_name: str,
+    main_lua_path: str,
+    log_file: str,
+    launch_id: str,
+    cancelled: threading.Event,
+) -> dict:
+    """Perform blocking file/process work away from the MCP event loop."""
+    if cancelled.is_set():
+        raise _LaunchCancelled
+
+    previous_launches = list(running_projects.values())
+    stop_tracked_simulators()
+    for previous in previous_launches:
+        _remove_launch_ipc(previous)
+
+    if cancelled.is_set():
+        raise _LaunchCancelled
+
+    launch = {
+        "launch_id": launch_id,
+        "project_dir": project_dir,
+        "main_lua": main_lua_path,
+        "log_file": log_file,
+        "helper_backups": {},
+        "generated_helpers": {},
+        "cleanup_files": _cleanup_launch_files,
+        **_launch_paths(project_name, launch_id),
+    }
+    finished_recording = take_finished_recording(project_dir)
+    if finished_recording is not None:
+        # The recording the relaunch finalized stays reportable instead of
+        # vanishing with the simulator it was attached to.
+        launch["finished_video_recording"] = finished_recording
+    _remove_launch_ipc(launch)
+    _ensure_relaunch_on_file_change()
+
+    for path in _helper_paths(project_dir).values():
+        launch["helper_backups"][path] = _snapshot_owned_file(path)
+
+    try:
+        create_logging_wrapper(project_dir, log_file)
+        logger_path = _helper_paths(project_dir)["logger"]
+        launch["generated_helpers"][logger_path] = Path(logger_path).read_bytes()
+        create_screenshot_module(project_dir, project_name, launch_id)
+        screenshot_path = _helper_paths(project_dir)["screenshot"]
+        launch["generated_helpers"][screenshot_path] = Path(screenshot_path).read_bytes()
+        create_touch_module(project_dir, project_name, launch_id)
+        touch_path = _helper_paths(project_dir)["touch"]
+        launch["generated_helpers"][touch_path] = Path(touch_path).read_bytes()
+        create_touch_overlay_module(project_dir)
+        overlay_path = _helper_paths(project_dir)["touch_overlay"]
+        launch["generated_helpers"][overlay_path] = Path(overlay_path).read_bytes()
+
+        launch["logger_injected"] = inject_module_into_main_lua(main_lua_path, "_mcp_logger")
+        launch["screenshot_injected"] = inject_module_into_main_lua(main_lua_path, "_mcp_screenshot")
+        launch["touch_injected"] = inject_module_into_main_lua(main_lua_path, "_mcp_touch")
+        launch["touch_overlay_injected"] = inject_module_into_main_lua(main_lua_path, "_mcp_touch_overlay")
+
+        if cancelled.is_set():
+            raise _LaunchCancelled
+
+        launch["started_at_ns"] = time.time_ns()
+        # The simulator streams its frames to the runtime dir's video FIFO when
+        # this env var points at it; everything else is inherited unchanged.
+        # The tap's cap is raised to the highest fps a recording may request so
+        # it never throttles below the MCP's output-side reduction (-r).
+        simulator_env = os.environ.copy()
+        simulator_env["SOLAR2D_VIDEO_PIPE"] = str(_VIDEO_PIPE_PATH)
+        simulator_env["SOLAR2D_VIDEO_FPS"] = str(MAX_FPS)
+        process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=simulator_env,
+            start_new_session=True,
+            close_fds=True,
+        )
+        launch["pid"] = process.pid
+        launch["process"] = process
+
+        if cancelled.is_set():
+            _stop_launch(launch)
+            raise _LaunchCancelled
+
+        return launch
+    except Exception:
+        # A helper generator may fail after writing its file. Capture any such
+        # partial output before rollback so newly-created files are removed and
+        # pre-existing files are restored safely.
+        for path in _helper_paths(project_dir).values():
+            if path not in launch["generated_helpers"] and Path(path).exists():
+                launch["generated_helpers"][path] = Path(path).read_bytes()
+        _stop_launch(launch)
+        raise
+
+
+def _read_launch_readiness(launch: dict) -> bool:
+    info_path = Path(launch["display_info_file"])
+    try:
+        stat = info_path.stat()
+        with info_path.open() as file:
+            info = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return False
+
+    return (
+        info.get("launchId") == launch["launch_id"]
+        and stat.st_mtime_ns >= launch["started_at_ns"]
+    )
+
+
+async def _wait_for_launch(launch: dict, deadline: float) -> tuple[str, int | None]:
+    while True:
+        return_code = launch["process"].poll()
+        if return_code is not None:
+            return "exited", return_code
+        if _read_launch_readiness(launch):
+            return "ready", None
+
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return "timeout", None
+        await asyncio.sleep(min(READINESS_POLL_SECONDS, remaining))
+
+
+async def _attempt_reload(launch: dict, main_lua_path: str, deadline: float) -> tuple[str, int | None, float]:
+    """Ask the already-running simulator to relaunch this project in place.
+
+    Reuses `_wait_for_launch`'s readiness polling: the reload re-executes the
+    same on-disk main.lua (already instrumented), so the touch module
+    republishes the same launch_id with a fresh mtime once it comes back up.
+    """
+    reload_start = asyncio.get_running_loop().time()
+    launch["started_at_ns"] = time.time_ns()
+    await asyncio.to_thread(_touch_main_lua, main_lua_path)
+    readiness, return_code = await _wait_for_launch(launch, deadline)
+    elapsed = asyncio.get_running_loop().time() - reload_start
+    return readiness, return_code, elapsed
+
+
+async def _cleanup_launch(launch: dict) -> None:
+    current = running_projects.get(launch["project_dir"])
+    if current is launch or (
+        current is not None and current.get("launch_id") == launch["launch_id"]
+    ):
+        running_projects.pop(launch["project_dir"], None)
+    await asyncio.to_thread(_stop_launch, launch)
+
+
+def _abandon_preparation(
+    task: asyncio.Task,
+    cancelled: threading.Event,
+    finished: Callable[[], None],
+) -> None:
+    """Ensure a worker that outlives its caller cannot leak a simulator."""
+    cancelled.set()
+
+    def cleanup_if_spawned(done: asyncio.Task) -> None:
+        async def finish_abandoned_launch() -> None:
+            try:
+                launch = done.result()
+            except (Exception, asyncio.CancelledError):
+                pass
+            else:
+                await _cleanup_launch(launch)
+            finally:
+                finished()
+
+        asyncio.create_task(finish_abandoned_launch())
+
+    task.add_done_callback(cleanup_if_spawned)
+
+
+async def _handle_owned_launch(
+    arguments: dict,
+    abandon: Callable[[asyncio.Task, threading.Event], None],
+    release_after: Callable[[asyncio.Task], None],
+) -> list[TextContent]:
     """Handle run_solar2d_project tool call."""
     project_path = arguments.get("project_path")
     debug = arguments.get("debug", True)
     no_console = arguments.get("no_console", False)
+    reload_requested = arguments.get("reload", False)
 
     if not project_path:
         return [TextContent(type="text", text="Error: project_path is required")]
@@ -866,117 +1329,212 @@ async def handle(arguments: dict) -> list[TextContent]:
     main_lua_path = find_main_lua(project_path)
     project_dir = str(Path(main_lua_path).parent)
 
-    # Kill any running simulators — only one can run at a time
-    # First, clean up any we're tracking
-    for old_dir in list(running_projects.keys()):
-        old_process = running_projects[old_dir]["process"]
-        if old_process.poll() is None:
-            old_process.terminate()
-            try:
-                old_process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                old_process.kill()
-        del running_projects[old_dir]
-
-    # Also kill any simulator processes we're NOT tracking (e.g. launched externally or before server restart)
-    try:
-        result = subprocess.run(["pgrep", "-f", "Corona Simulator"], capture_output=True, text=True)
-        for pid_str in result.stdout.strip().splitlines():
-            try:
-                pid = int(pid_str)
-                os.kill(pid, signal.SIGTERM)
-            except (ValueError, ProcessLookupError, PermissionError):
-                pass
-    except FileNotFoundError:
-        pass
-
-    # Check if main.lua exists
     if not os.path.exists(main_lua_path):
         return [TextContent(
             type="text",
             text=f"Error: main.lua not found at {main_lua_path}"
         )]
 
-    # Create log file with project-based name (not timestamp) for predictable location
+    reload_note = ""
+    if reload_requested:
+        tracked_launch, unavailable_reason = get_current_launch(project_path)
+        if tracked_launch is not None:
+            reload_deadline = asyncio.get_running_loop().time() + LAUNCH_TIMEOUT_SECONDS
+            try:
+                readiness, return_code, elapsed = await _attempt_reload(
+                    tracked_launch, main_lua_path, reload_deadline
+                )
+            except OSError as error:
+                return [TextContent(
+                    type="text",
+                    text=(
+                        "Error: Could not trigger an in-place Solar2D reload; "
+                        f"the tracked simulator was left running: {error}"
+                    ),
+                )]
+            if readiness == "ready":
+                return [TextContent(
+                    type="text",
+                    text=(
+                        "Solar2D Simulator reloaded in place!\n\n"
+                        f"Launch path: reload\n"
+                        f"Reload latency: {elapsed:.2f}s\n"
+                        f"Project: {main_lua_path}\n"
+                        f"PID: {tracked_launch['pid']}\n"
+                        f"Launch ID: {tracked_launch['launch_id']}\n"
+                        f"Log file: {tracked_launch['log_file']}\n"
+                        f"Screenshot dir: {tracked_launch['screenshot_dir']}\n\n"
+                        "Use read_solar2d_logs to view the console output.\n"
+                        "Use start_screenshot_recording to capture screenshots."
+                    ),
+                )]
+            if readiness == "timeout":
+                return [TextContent(
+                    type="text",
+                    text=(
+                        "Error: Solar2D reload did not publish fresh instrumentation "
+                        f"within {LAUNCH_TIMEOUT_SECONDS:g}s.\n\n"
+                        "Launch path: reload\n"
+                        f"Reload latency: {elapsed:.2f}s\n"
+                        f"PID: {tracked_launch['pid']} (left running)\n"
+                        f"Launch ID: {tracked_launch['launch_id']}\n"
+                        "Fix the project error and reload again."
+                    ),
+                )]
+            await _cleanup_launch(tracked_launch)
+            reload_note = (
+                "Reload requested but fell back to a fresh spawn: "
+                f"the tracked simulator exited with code {return_code}.\n\n"
+            )
+        else:
+            reload_note = f"Reload requested but fell back to a fresh spawn: {unavailable_reason}\n\n"
+
     project_name = Path(project_dir).name
     log_file = os.path.join(tempfile.gettempdir(), f"corona_log_{project_name}.txt")
+    launch_id = uuid.uuid4().hex
 
-    # Create Lua logging wrapper
-    create_logging_wrapper(project_dir, log_file)
-
-    # Create screenshot module
-    create_screenshot_module(project_dir, project_name)
-
-    # Create touch module
-    create_touch_module(project_dir, project_name)
-
-    # Create touch overlay module (visual indicators)
-    create_touch_overlay_module(project_dir)
-
-    # Inject modules into main.lua if not already present
-    logger_injected = inject_module_into_main_lua(main_lua_path, "_mcp_logger")
-    screenshot_injected = inject_module_into_main_lua(main_lua_path, "_mcp_screenshot")
-    touch_injected = inject_module_into_main_lua(main_lua_path, "_mcp_touch")
-    inject_module_into_main_lua(main_lua_path, "_mcp_touch_overlay")
-
-    # Build the command
     cmd = [simulator_path]
+    if platform.system() == "Darwin":
+        if no_console:
+            cmd.extend(["-no-console", "YES"])
+        if debug:
+            cmd.extend(["-debug", "1"])
+        cmd.extend(["-project", main_lua_path])
+    else:
+        cmd.append(main_lua_path)
 
-    if no_console:
-        cmd.extend(["-no-console", "YES"])
-
-    if debug:
-        cmd.extend(["-debug", "1"])
-
-    cmd.extend(["-project", main_lua_path])
+    loop = asyncio.get_running_loop()
+    spawn_start = loop.time()
+    deadline = spawn_start + LAUNCH_TIMEOUT_SECONDS
+    cancelled = threading.Event()
+    preparation = asyncio.create_task(asyncio.to_thread(
+        _prepare_and_spawn,
+        cmd=cmd,
+        project_dir=project_dir,
+        project_name=project_name,
+        main_lua_path=main_lua_path,
+        log_file=log_file,
+        launch_id=launch_id,
+        cancelled=cancelled,
+    ))
 
     try:
-        # Run the simulator (non-blocking). This MCP server uses stdio for
-        # JSON-RPC, so the child process must not inherit those descriptors.
-        # _mcp_logger.lua handles app logging through a separate file.
-        process = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-            close_fds=True
+        launch = await asyncio.wait_for(
+            asyncio.shield(preparation),
+            timeout=max(0, deadline - loop.time()),
         )
-
-        # Track the running project
-        running_projects[project_dir] = {
-            "pid": process.pid,
-            "log_file": log_file,
-            "process": process,
-            "main_lua": main_lua_path
-        }
-
-        # Build status messages
-        status_lines = []
-        if logger_injected:
-            status_lines.append("Logger injected into main.lua")
-        else:
-            status_lines.append("Logger already present in main.lua")
-
-        if screenshot_injected:
-            status_lines.append("Screenshot module injected into main.lua")
-        else:
-            status_lines.append("Screenshot module already present in main.lua")
-
-        if touch_injected:
-            status_lines.append("Touch module injected into main.lua")
-        else:
-            status_lines.append("Touch module already present in main.lua")
-
-        screenshot_dir = os.path.join(tempfile.gettempdir(), f"solar2d_screenshots_{project_name}")
-
+    except asyncio.TimeoutError:
+        abandon(preparation, cancelled)
         return [TextContent(
             type="text",
-            text=f"Solar2D Simulator launched successfully!\n\nProject: {main_lua_path}\nPID: {process.pid}\nLog file: {log_file}\nScreenshot dir: {screenshot_dir}\nDebug: {debug}\nNo Console: {no_console}\n\n{chr(10).join(status_lines)}\n\nAll print() output will be captured automatically.\nUse read_solar2d_logs to view the console output.\nUse start_screenshot_recording to capture screenshots."
+            text=(
+                f"Error: Solar2D launch timed out after {LAUNCH_TIMEOUT_SECONDS:g}s "
+                "during project setup/start. The MCP connection is healthy; "
+                "only this launch is being stopped."
+            ),
         )]
-
+    except asyncio.CancelledError:
+        abandon(preparation, cancelled)
+        raise
+    except _LaunchCancelled:
+        return [TextContent(type="text", text="Error: Solar2D launch was cancelled during setup.")]
     except Exception as e:
         return [TextContent(
             type="text",
-            text=f"Error launching Solar2D Simulator: {str(e)}"
+            text=f"Error launching Solar2D Simulator during project setup/start: {str(e)}"
         )]
+
+    running_projects[project_dir] = launch
+    try:
+        readiness, return_code = await _wait_for_launch(launch, deadline)
+    except asyncio.CancelledError:
+        release_after(asyncio.create_task(_cleanup_launch(launch)))
+        raise
+
+    if readiness != "ready":
+        cleanup = asyncio.create_task(_cleanup_launch(launch))
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            release_after(cleanup)
+            raise
+        if readiness == "exited":
+            detail = f"exited with code {return_code}"
+        else:
+            detail = f"did not publish launch-specific readiness within {LAUNCH_TIMEOUT_SECONDS:g}s"
+        return [TextContent(
+            type="text",
+            text=(
+                f"Error: Solar2D Simulator {detail} while waiting for instrumentation "
+                f"(launch {launch_id}). The MCP connection is healthy; only this "
+                "launch was stopped."
+            ),
+        )]
+
+    status_lines = [
+        "Logger injected into main.lua" if launch["logger_injected"] else "Logger already present in main.lua",
+        (
+            "Screenshot module injected into main.lua"
+            if launch["screenshot_injected"]
+            else "Screenshot module already present in main.lua"
+        ),
+        "Touch module injected into main.lua" if launch["touch_injected"] else "Touch module already present in main.lua",
+    ]
+
+    spawn_elapsed = asyncio.get_running_loop().time() - spawn_start
+    return [TextContent(
+        type="text",
+        text=(
+            f"{reload_note}"
+            "Solar2D Simulator launched and instrumentation is ready!\n\n"
+            "Launch path: fresh spawn\n"
+            f"Launch latency: {spawn_elapsed:.2f}s\n"
+            f"Project: {main_lua_path}\n"
+            f"PID: {launch['pid']}\n"
+            f"Launch ID: {launch_id}\n"
+            f"Log file: {log_file}\n"
+            f"Screenshot dir: {launch['screenshot_dir']}\n"
+            f"Debug: {debug}\n"
+            f"No Console: {no_console}\n\n"
+            f"{chr(10).join(status_lines)}\n\n"
+            "All print() output will be captured automatically.\n"
+            "Use read_solar2d_logs to view the console output.\n"
+            "Use start_screenshot_recording to capture screenshots."
+        ),
+    )]
+
+
+async def handle(arguments: dict) -> list[TextContent]:
+    """Serialize launch ownership without blocking the MCP event loop."""
+    launch_lock = _get_launch_lock()
+    if launch_lock.locked():
+        return [TextContent(
+            type="text",
+            text=(
+                "Error: Another Solar2D launch is already in progress in this MCP server. "
+                "The MCP connection is healthy; retry after that launch finishes."
+            ),
+        )]
+
+    await launch_lock.acquire()
+    handed_off = False
+
+    def release_after(task: asyncio.Task) -> None:
+        nonlocal handed_off
+        handed_off = True
+        task.add_done_callback(lambda _: launch_lock.release())
+
+    def abandon(preparation: asyncio.Task, cancelled: threading.Event) -> None:
+        nonlocal handed_off
+        handed_off = True
+        _abandon_preparation(preparation, cancelled, launch_lock.release)
+
+    try:
+        return await _handle_owned_launch(
+            arguments,
+            abandon=abandon,
+            release_after=release_after,
+        )
+    finally:
+        if not handed_off:
+            launch_lock.release()

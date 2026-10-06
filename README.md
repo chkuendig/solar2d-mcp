@@ -62,6 +62,36 @@ claude mcp list
 
 You can also add it to a specific project using `--scope project` or create a `.mcp.json` file in your project root.
 
+### Shared runtimes
+
+Multiple MCP clients may connect to the same long-lived runtime, but Solar2D
+simulator access is intentionally limited to one client at a time. The slot is
+claimed lazily on the first simulator-dependent tool call. Other clients stay
+connected and receive a `Solar2D runtime is busy` response until the owner
+disconnects. On disconnect, the server stops only simulator processes it
+started and releases the slot; it never uses a container-wide `pkill`.
+
+Launch requests within one MCP server are also serialized through readiness.
+If another run request overlaps setup or readiness, it receives a prompt
+`launch is already in progress` error while the MCP connection stays healthy.
+Only the winning launch can own the tracked simulator.
+
+`run_solar2d_project(reload=true)` reuses the same tracked simulator and the
+same launch lock/readiness serialization as a fresh spawn; it does not
+acquire a second lease or change busy-owner semantics.
+
+When the owning MCP client disconnects or its session times out, the simulator
+is stopped before launch-specific IPC files are removed. Helper modules and
+`main.lua` requires created by that launch are also removed or restored when
+their contents are still unchanged; later user edits are left intact.
+
+Set `SOLAR2D_MCP_RUNTIME_DIR` when several server processes need to coordinate
+through a specific shared directory. They must see the same filesystem path.
+
+Set `SOLAR2D_MCP_ARTIFACT_DIR` to a host-mounted directory when encoded
+recordings must survive the runtime container or be uploaded by the client.
+
+
 ## First-Time Setup
 
 On first use, the server needs to know where your Solar2D Simulator is installed.
@@ -95,8 +125,19 @@ Assistant: [calls configure_solar2d(confirm=true)]
 - `run_solar2d_project` - Run a Solar2D project in the simulator
   - Accepts project directory or main.lua path
   - Optional debug and console flags
-  - Launches simulator in background
+  - Launches simulator in background and returns after fresh instrumentation is ready
+  - Fails within 20 seconds if the child exits or current-launch readiness is not published
   - Injects logger that captures all print() output
+  - `reload=true` reloads an already-running simulator in place instead of
+    stopping and respawning it (Linux only). Falls back to a fresh spawn
+    automatically if no live simulator is tracked for the project. A reload
+    timeout leaves the tracked simulator running so the next edit can recover
+    without a full restart. The response
+    reports which path was taken (`Launch path: reload` or `fresh spawn`)
+    and the measured latency, so an edit-reload-screenshot loop can skip
+    the full boot/login/navigation cost of a restart on every iteration.
+    On Linux, fresh launches ensure the simulator-wide file-change preference
+    is enabled in the `homescreen` sandbox.
 - `read_solar2d_logs` - Read console logs from running Solar2D Simulator
   - View all Lua print() statements from your game code
   - Configurable number of recent lines to display
@@ -111,6 +152,13 @@ Assistant: [calls configure_solar2d(confirm=true)]
   - Default recording duration: 60 seconds (max: 300 seconds / 5 minutes)
   - Can extend recording while already capturing
 - `stop_screenshot_recording` - Stop screenshot recording early
+- `start_video_recording` - Start a real-time framebuffer recording
+  - Captures the simulator display directly at 30 fps by default (15-60 fps)
+  - Writes H.264/yuv420p MP4 instead of stitching periodic JPEG screenshots
+  - Requires a runtime whose simulator exposes the offscreen frame tap
+    (`SOLAR2D_VIDEO_PIPE`) plus `ffmpeg` and `ffprobe`; no X11 server is involved
+- `stop_video_recording` - Finalize and verify the real-time MP4
+  - Reports codec, pixel format, even dimensions, frame count, duration, measured fps, and dropped frames
 - `get_simulator_screenshot` - Get screenshot(s) for visual analysis
   - `which="latest"` - Capture fresh screenshot now (default)
   - `which="last"` - Get most recent from recording session
@@ -243,9 +291,13 @@ The MCP server can capture screenshots from the running simulator for visual ana
 
 ### Screenshot Location
 
-Screenshots are saved to: `/tmp/solar2d_screenshots_<project-name>/`
+Screenshots are saved to: `/tmp/solar2d_screenshots_<project-name>_<launch-id>/`
 
-The directory is cleared when the simulator starts, but screenshots persist across recording sessions within the same run.
+Each launch gets a separate directory; screenshots persist across recording sessions within that run.
+
+Simulator screenshot references used by `preview_social_post` (`latest`,
+`last`, or a number) resolve only inside the currently tracked launch's
+directory. An inactive project returns an error instead of using older files.
 
 ### Recording Workflow
 
@@ -264,6 +316,39 @@ Assistant: [calls stop_screenshot_recording]
 ### Extending Recordings
 
 You can call `start_screenshot_recording` while already recording to extend the duration. Screenshots continue from where they left off (not reset).
+
+### Recording Smooth Video
+
+The screenshot recorder is for visual diagnostics. Its full-stage JPEG writes
+are capped at 10 fps and may run slower under load, so changing the output fps
+does not make its video smoother. For animation evidence use the framebuffer
+recorder instead:
+
+1. Call `start_video_recording` (30 fps by default).
+2. Drive the simulator while the same MCP session remains connected.
+3. Call `stop_video_recording` to finalize and verify the MP4.
+
+The recorder does not touch a display server. The launcher points the
+simulator's offscreen frame tap (`SOLAR2D_VIDEO_PIPE`) at a FIFO in the shared
+runtime directory and raises the tap's frame cap (`SOLAR2D_VIDEO_FPS`) to the
+highest fps a recording may request, so the requested fps is always governed by
+the output side alone. A relay thread streams the tap's framed BGRA frames
+into ffmpeg: GL's bottom-up rows are flipped, dimensions are cropped to even
+yuv420p sizes, and H.264 is encoded at a constant frame rate using wall-clock
+timestamps, so dropped frames never compress the timeline. The duration
+argument is a safety ceiling; stopping early is the normal workflow.
+
+The stop report includes the frames the tap produced and how many it dropped
+(sequence gaps: frames the tap itself skipped under backpressure, not frames
+held back by the fps cap). The relay's drop count and the engine tap's own
+drop counter count the same events and should always match; a mismatch is a
+bug in one of them. Recordings are written as fragmented MP4 with a
+one-second fragment cadence, so even a hard-killed run leaves the captured
+frames in a playable file with at most about a second unflushed. If the
+window is resized mid-recording, the MP4 is finalized at the original size and
+the stop report says so. A simulator relaunch finalizes any active recording;
+the next `stop_video_recording` on that project reports it instead of
+reporting nothing.
 
 ## Touch Interaction
 

@@ -4,7 +4,8 @@ Solar2D MCP Tools - Tool definitions and dispatcher.
 
 from mcp.types import ImageContent, TextContent, Tool
 
-from tools import configure, list_projects, read_logs, run_project, screenshot, social, solar_scope, state, touch, trello
+from runtime import simulator_busy_message
+from tools import configure, list_projects, read_logs, run_project, screenshot, social, solar_scope, state, touch, trello, video
 
 # Collect all tools
 TOOLS: list[Tool] = [
@@ -13,6 +14,7 @@ TOOLS: list[Tool] = [
     read_logs.TOOL,
     list_projects.TOOL,
     *screenshot.TOOLS,  # Include all screenshot tools
+    *video.TOOLS,  # Include real-time video recording tools
     *touch.TOOLS,  # Include touch simulation tools
     *state.TOOLS,  # Include game state and scenario tools
     *solar_scope.TOOLS,  # Include SolarScope test-runner tools
@@ -31,6 +33,8 @@ _HANDLERS = {
     "get_simulator_screenshot": screenshot.handle_get_screenshot,
     "list_screenshots": screenshot.handle_list_screenshots,
     "encode_recording_video": screenshot.handle_encode_video,
+    "start_video_recording": video.handle_start_recording,
+    "stop_video_recording": video.handle_stop_recording,
     "simulate_tap": touch.handle_simulate_tap,
     "simulate_drag": touch.handle_simulate_drag,
     "find_object": touch.handle_find_object,
@@ -44,9 +48,37 @@ _HANDLERS = {
 }
 
 
+_SIMULATOR_TOOLS = frozenset({
+    "run_solar2d_project",
+    "read_solar2d_logs",
+    "list_running_projects",
+    "start_screenshot_recording",
+    "stop_screenshot_recording",
+    "get_simulator_screenshot",
+    "list_screenshots",
+    "encode_recording_video",
+    "start_video_recording",
+    "stop_video_recording",
+    "simulate_tap",
+    "simulate_drag",
+    "find_object",
+    "get_display_info",
+    "run_solar_scope_test",
+    "rerun_solar_scope_test",
+    "get_solar_scope_result",
+    "get_game_state",
+    "run_scenario",
+    "list_scenarios",
+})
+
+
 async def call_tool(name: str, arguments: dict) -> list[TextContent | ImageContent]:
-    """Dispatch a tool call to the appropriate handler."""
+    """Dispatch a tool call without letting a busy simulator kill the connection."""
     handler = _HANDLERS.get(name)
     if handler is None:
         raise ValueError(f"Unknown tool: {name}")
+    if name in _SIMULATOR_TOOLS:
+        busy = simulator_busy_message()
+        if busy is not None:
+            return [TextContent(type="text", text=busy)]
     return await handler(arguments)
