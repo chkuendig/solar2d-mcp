@@ -1,5 +1,9 @@
 # Solar2D MCP Server
 
+> **Retired (2026-10-07).** This project is no longer maintained and the
+> repository is archived read-only. The code and history remain available
+> for reference.
+
 A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server for working with Solar2D (Corona SDK) projects. This server enables AI assistants to run, debug, and interact with Solar2D games.
 
 **Works with any MCP-compatible client**, including:
